@@ -16,6 +16,7 @@ from torch.nn import functional as F
 from torch.optim import Adam, Optimizer
 from dataclasses import dataclass
 from io import StringIO
+import random
 import sys
 import functools
 import time
@@ -29,7 +30,7 @@ import os
 # From https://github.com/CompVis/latent-diffusion/blob/main/models/ldm/celeba256/config.yaml
 # and https://github.com/Stability-AI/stablediffusion/blob/main/configs/stable-diffusion/v2-inference-v.yaml
 VAE_CONFIG = VAEConfig(
-    learn_rate=5e-4,
+    learn_rate=1e-3,
     num_channels=(
         1 * 128,
         2 * 128,
@@ -307,9 +308,10 @@ class ModelRunner:
         return controller.model()
 
 
-    def make_dataloader(self, params: RunModelParams):
+    def make_dataloader(self, params: RunModelParams, epoch: int, seed: int = 0):
         if params.dist_params is not None:
-            sampler=DistributedSampler(params.dataset, shuffle=True)
+            sampler=DistributedSampler(params.dataset, shuffle=True, seed=seed)
+            sampler.set_epoch(epoch)
         else:
             sampler = None
 
@@ -318,7 +320,7 @@ class ModelRunner:
                             shuffle=None if sampler is not None else True, 
                             sampler=sampler,
                             num_workers=min(12, os.cpu_count() or 0))
-        return loader, sampler
+        return loader
 
 
     def summary_writer(self, params: RunModelParams):
@@ -329,7 +331,6 @@ class ModelRunner:
 
 
     def train_loop(self, params: RunModelParams):
-        loader, sampler = self.make_dataloader(params)
         batch_size = self.batch_size(params.controller, params.model, params.device)
         self.log(f"Using batch size {batch_size}")
 
@@ -339,11 +340,9 @@ class ModelRunner:
 
                 epoch_start = time.time()
 
-                if sampler is not None:
-                    sampler.set_epoch(epoch)
-
                 avg_loss = torch.zeros(1, device=params.device)
 
+                loader = self.make_dataloader(params, epoch)
                 for batch_idx, (batch, label) in enumerate(loader, start=1):
                     batch: Tensor = batch.to(params.device)
                     one_hot_label = F.one_hot(label, NUM_CLASS).to(params.device)
@@ -437,10 +436,7 @@ class ModelRunner:
         params.model.eval()
 
         start = time.time()
-        loader, sampler = self.make_dataloader(params)
-
-        if sampler is not None:
-            sampler.set_epoch(1)
+        loader = self.make_dataloader(params, epoch=0, seed=random.randint(0, 10000))
 
         input_images = torch.empty(0)
         generated_images = torch.empty(0)
