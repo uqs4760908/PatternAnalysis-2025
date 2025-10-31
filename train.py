@@ -8,7 +8,7 @@ from torch import multiprocessing as mp
 from torch import distributed as dist
 from torch import GradScaler
 from torch.utils.tensorboard import SummaryWriter
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import LinearLR, ReduceLROnPlateau
 from torchvision import utils as vutils
 from tempfile import NamedTemporaryFile
 from torch import nn, Tensor
@@ -436,7 +436,7 @@ class ModelRunner:
             dataset=dataset,
             dist_params=train_params.dist_params,
             controller=train_params.controller
-        ), tag="Test")
+        ), tag=tag)
 
         self.log(f"{tag} loss: {stats.loss.item()}")
 
@@ -587,7 +587,7 @@ class VAEController(ModelController):
                               lr=VAE_CONFIG.learn_rate, fused=True, 
                               weight_decay=VAE_CONFIG.weight_decay)
         self.scaler = PortableGradScaler()
-        self.scheduler = ReduceLROnPlateau(self.optimiser)
+        self.scheduler = LinearLR(self.optimiser)
 
 
     def num_epochs(self) -> int:
@@ -603,7 +603,7 @@ class VAEController(ModelController):
 
     
     def step(self, loss: Tensor) -> None:
-        self.scheduler.step(loss)
+        self.scheduler.step()
 
 
     def name(self) -> str:
