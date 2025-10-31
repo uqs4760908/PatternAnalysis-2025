@@ -372,9 +372,12 @@ class ModelRunner:
                         summary.add_scalar("Train/GPU memory allocated(GB)", stats.device_stats.memory_allocated / (2 ** 30), step)
 
                 if params.is_master():
+                    # Note: do not use params.model here since it might be DistributedDataParallel
+                    # When loading saved model we are loading params.controller.model(),
+                    # so be consistent
                     torch.save({
                         TRAIN_STATUS_KEY: TRAIN_STATUS_TRAINING,
-                        MODEL_PARAMS_KEY: params.model.state_dict()
+                        MODEL_PARAMS_KEY: params.controller.model().state_dict()
                     }, params.controller.save_path())
 
                 dist.barrier()
@@ -389,7 +392,6 @@ class ModelRunner:
 
                 if summary is not None:
                     summary.add_scalar("Train/loss", avg_loss, global_step=epoch)
-                    summary.add_scalar("Train/learn rate", params.controller.get_lr(), epoch)
 
                     summary.add_scalar("Validation/loss", eval_stats.loss, global_step=epoch)
                     summary.add_image("Validation/images(ground truth)", 
@@ -405,7 +407,7 @@ class ModelRunner:
 
             torch.save({
                 TRAIN_STATUS_KEY: TRAIN_STATUS_DONE,
-                MODEL_PARAMS_KEY: params.model.state_dict()
+                MODEL_PARAMS_KEY: params.controller.model().state_dict()
             }, params.controller.save_path())
             dist.barrier()
 
