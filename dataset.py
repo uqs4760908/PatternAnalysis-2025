@@ -1,5 +1,5 @@
 from torch.utils.data import Dataset
-from torchvision.transforms.v2 import ToDtype
+from torchvision.transforms.v2 import ToDtype, Compose, RandomHorizontalFlip, Transform
 from torchvision.io.image import decode_image
 from pathlib import Path
 from PIL import Image
@@ -10,7 +10,11 @@ from config import ImageInfo
 
 ALZHEIMER_DISEASE = "AD"
 COGNITIVE_NORMAL = "NC"
-TRANSFORM = ToDtype(dtype=torch.float32, scale=True)
+TRAIN_TRANSFORM = Compose([
+    ToDtype(dtype=torch.float32, scale=True),
+    RandomHorizontalFlip()
+])
+TEST_TRANSFORM = ToDtype(dtype=torch.float32, scale=True)
 
 
 AD_LABEL = 0
@@ -22,10 +26,12 @@ Item = tuple[torch.Tensor, int]
 class ImageListDataset(Dataset[Item]):
     def __init__(self, 
                  ad_images: list[Path],
-                 cn_images: list[Path]):
+                 cn_images: list[Path],
+                 transform: Transform):
         super().__init__()
         self.ad_images = ad_images
         self.cn_images = cn_images
+        self.transform = transform
         with Image.open(ad_images[0]) as image:
             # PIL specifies size in (width, height). We want (height, width)
             self.size = image.size[1], image.size[0]
@@ -47,7 +53,7 @@ class ImageListDataset(Dataset[Item]):
 
         path = images[index]
         image = decode_image(str(path))
-        return TRANSFORM(image), label
+        return self.transform(image), label
 
 
 class ANDIDataset:
@@ -67,15 +73,18 @@ class ANDIDataset:
 
         self.train_dataset= ImageListDataset(
                 train_ad_images[:-num_validation],
-                train_cn_images[:-num_validation])
+                train_cn_images[:-num_validation],
+                TRAIN_TRANSFORM)
 
         self.validation_dataset = ImageListDataset(
                 train_ad_images[-num_validation:],
-                train_cn_images[-num_validation:])
+                train_cn_images[-num_validation:],
+                TEST_TRANSFORM)
         
         self.test_dataset = ImageListDataset(
                 test_ad_images,
-                test_cn_images)
+                test_cn_images,
+                TEST_TRANSFORM)
 
     @property
     def image_info(self) -> ImageInfo:
