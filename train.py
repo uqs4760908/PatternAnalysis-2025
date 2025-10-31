@@ -376,16 +376,11 @@ class ModelRunner:
                         summary.add_scalar("Train/GPU temperature(C)", stats.device_stats.temperature, step)
                         summary.add_scalar("Train/GPU memory allocated(GB)", stats.device_stats.memory_allocated / (2 ** 30), step)
 
-                if params.dist_params is not None:
-                    dist.barrier()
                 self.log(f"Validating...")
-                eval_stats = self.eval_loop(RunModelParams(
-                    model=params.model,
-                    device=params.device,
-                    dataset=self.dataset.validation_dataset,
-                    dist_params=params.dist_params,
-                    controller=params.controller
-                ), tag="Validation")
+                eval_stats = self.train_eval(params, summary, 
+                                   self.dataset.validation_dataset, 
+                                   tag="Validation",
+                                   step=epoch)
 
                 if params.is_master() and last_loss > eval_stats.loss.item():
                     # Note: do not use params.model here since it might be DistributedDataParallel
@@ -401,36 +396,47 @@ class ModelRunner:
                     summary.add_scalar("Train/loss", avg_loss, global_step=epoch)
                     summary.add_scalar("Train/learn rate", params.controller.get_lr(), global_step=epoch)
 
-                    summary.add_scalar("Validation/loss", eval_stats.loss, global_step=epoch)
-                    summary.add_image("Validation/images(ground truth)", 
-                                       vutils.make_grid(eval_stats.input_images.detach().cpu()), 
-                                               global_step=epoch)
-                    summary.add_image("Validation/images(generated)", 
-                                       vutils.make_grid(eval_stats.generated_images.detach().cpu()), 
-                                       global_step=epoch)
-
                 params.controller.step(eval_stats.loss)
                 epoch_end = time.time()
                 self.log(f"Epoch {epoch} done, took {epoch_end - epoch_start:2} seconds")
 
-            if params.dist_params is not None:
-                dist.barrier()
-
             self.log(f"Testing...")
-            test_stats = self.eval_loop(RunModelParams(
-                model=params.model,
-                device=params.device,
+            self.train_eval(
+                train_params=params,
+                summary=summary,
                 dataset=self.dataset.test_dataset,
-                dist_params=params.dist_params,
-                controller=params.controller
-            ), tag="Test")
+                tag="Test",
+                step=0
+            )
 
-            if summary is not None:
-                summary.add_scalar("Test loss", test_stats.loss)
-                summary.add_image("Test images(ground truth)", 
-                                   vutils.make_grid(test_stats.input_images.detach().cpu()))
-                summary.add_image("Test images(generated)",
-                                  vutils.make_grid(test_stats.generated_images.detach().cpu()))
+
+    def train_eval(self, 
+                      train_params: RunModelParams, 
+                      summary: typing.Optional[SummaryWriter], 
+                      dataset: ImageListDataset,
+                      tag: str, 
+                      step: int):
+        stats = self.eval_loop(RunModelParams(
+            model=train_params.model,
+            device=train_params.device,
+            dataset=dataset,
+            dist_params=train_params.dist_params,
+            controller=train_params.controller
+        ), tag="Test")
+
+        self.log(f"{tag} loss: {stats.loss.item()}")
+
+        if summary is None:
+            return stats
+
+        summary.add_scalar(f"{tag}/loss", stats.loss, global_step=step)
+        summary.add_image(f"{tag}/images(ground truth)", 
+                           vutils.make_grid(stats.input_images.detach().cpu()), 
+                                   global_step=step)
+        summary.add_image(f"{tag}/images(generated)", 
+                           vutils.make_grid(stats.generated_images.detach().cpu()), 
+                           global_step=step)
+        return stats
 
 
     @torch.inference_mode()
