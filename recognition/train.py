@@ -83,7 +83,6 @@ DIFFUSION_CONFIG = DiffusionConfig(
         embedding_dim=320,
         use_attention=(True,) * 4
     ),
-    latent_scale_factor=0.18215
 )
 
 
