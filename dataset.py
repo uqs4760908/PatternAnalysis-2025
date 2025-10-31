@@ -1,9 +1,8 @@
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from torchvision.transforms.v2 import ToDtype
 from torchvision.io.image import decode_image
 from pathlib import Path
 from PIL import Image
-import os
 import torch
 
 from config import ImageInfo
