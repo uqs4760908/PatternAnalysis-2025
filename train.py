@@ -312,26 +312,22 @@ class ModelRunner:
 
 
     def optimise_model(self, model: nn.Module, device: torch.device) -> nn.Module:
-        model = model.to(device)
-
         if device.type == "cuda":
             version = torch.cuda.get_device_capability(device)
             properties = torch.cuda.get_device_properties(device)
 
             # torch.compile requires CUDA 7.0+
-            # Also, compile() crashes on some device
-            # So far if device has more than 68 compute units compile() works
-            # See is_big_gpu() in torch/_inductor/utils.py
-            if version >= (7, 0) and properties.multi_processor_count >= 68:
+            # Also, compile() crashes on my RTX 3060
+            if version >= (7, 0) and properties.name != "NVIDIA GeForce RTX 3060":
                 model.compile()
         else:
           model.compile()
         return model
 
 
-    def optimise_controller(self, controller: ModelController, device: torch.device):
+    def send_model_to_device(self, controller: ModelController, device: torch.device):
         for model in [controller.model(), *controller.dependent_models()]:
-            self.optimise_model(model, device)
+            model.to(device)
         return controller.model()
 
 
@@ -360,6 +356,8 @@ class ModelRunner:
     def train_loop(self, params: RunModelParams):
         batch_size = self.batch_size(params.controller, params.model, params.device)
         self.log(f"Using batch size {batch_size}")
+
+        self.optimise_model(params.model, params.device)
 
         with self.summary_writer(params) as summary:
             last_loss = float("inf")
@@ -533,7 +531,7 @@ class ModelRunner:
         with self.setup(rank, world_size, file):
             accelerator = get_accelerator()
             device = torch.device(f"{accelerator.type}:{rank}")
-            model = self.optimise_controller(controller, device)
+            model = self.send_model_to_device(controller, device)
             model = nn.parallel.DistributedDataParallel(model)
 
             fn(RunModelParams(
@@ -570,7 +568,7 @@ class ModelRunner:
         # mps does not support DistributedDataParallel
         if nprocs == 1 or (device and device.type == "mps"):
             fn(RunModelParams(
-                model=self.optimise_controller(controller, device),
+                model=self.send_model_to_device(controller, device),
                 device=device,
                 dataset=dataset,
                 dist_params=None,
