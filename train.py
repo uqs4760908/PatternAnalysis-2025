@@ -460,8 +460,9 @@ class ModelRunner:
 
         loader = self.make_dataloader(params, epoch=0)
         batch, labels = next(iter(loader))
-        batch, labels = batch.to(params.device), labels.to(params.device)
-        images = train_params.controller.generate(16, batch, labels)
+        batch = batch.to(params.device)
+        one_hot_label = F.one_hot(labels, NUM_CLASS).to(params.device)
+        images = train_params.controller.generate(16, batch, one_hot_label)
         images.update(stats.generated_images)
 
         summary.add_scalar(f"{tag}/loss", stats.loss, global_step=step)
@@ -482,7 +483,6 @@ class ModelRunner:
         avg_loss = torch.zeros(1, device=params.device, requires_grad=False)
 
         assert loader.batch_size
-
 
         for batch_idx, (batch, label) in enumerate(loader, start=1):
             with torch.autocast(device_type=params.device.type):
@@ -758,8 +758,10 @@ class DiffusionModelController(ModelController):
                             device_stats=DeviceStats.capture(batch.device))
 
 
+    @torch.inference_mode()
     def generate(self, n: int, batch: Tensor, label: Tensor) -> dict[str, Tensor]:
         label = label.float()
+        self.vae.eval()
 
         with torch.autocast(device_type=batch.device.type):
             latent = self.vae.encode(batch)
