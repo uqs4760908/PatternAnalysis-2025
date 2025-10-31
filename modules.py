@@ -615,7 +615,7 @@ class DiffusionModel(nn.Module):
     @torch.inference_mode()
     def generate(self, image_info: ImageInfo, label: torch.Tensor) -> torch.Tensor:
         noise = torch.normal(0, 1, 
-                             size=(image_info.depth, *image_info.size), device=self.timesteps.device)
+                             size=(image_info.depth, *image_info.size), device=label.device)
 
         for t in reversed(range(self.timesteps.size(0))):
             t = torch.full((1,), 1, device=label.device)
