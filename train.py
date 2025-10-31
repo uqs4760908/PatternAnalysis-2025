@@ -102,7 +102,7 @@ class PortableGradScaler:
             optimiser.zero_grad(set_to_none=True)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class DistributedParams:
     rank: int
 
@@ -110,13 +110,31 @@ class DistributedParams:
 RunModelFn = typing.Callable[[nn.Module, Tensor], typing.Any]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
+class DeviceStats:
+    temperature: int
+    usage: int
+    memory_allocated: int
+
+    @staticmethod
+    def capture(device: torch.device) -> typing.Optional["DeviceStats"]:
+        if device.type == "cuda":
+            return DeviceStats(
+                    temperature=torch.cuda.temperature(device),
+                    usage=torch.cuda.utilization(device),
+                    memory_allocated=torch.cuda.memory_allocated(device)
+            )
+        return None
+
+
+@dataclass(frozen=True, slots=True)
 class RunStats:
     loss: Tensor
     generated_images: Tensor
+    device_stats: typing.Optional[DeviceStats]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class EvalStats:
     loss: Tensor
     input_images: Tensor
@@ -277,7 +295,7 @@ class ModelRunner:
                             batch_size=self.batch_size(params.controller ,params.model, params.device), 
                             shuffle=None if sampler is not None else True, 
                             sampler=sampler,
-                            num_workers=os.cpu_count() or 0)
+                            num_workers=min(12, os.cpu_count() or 0))
         return loader, sampler
 
 
@@ -310,11 +328,26 @@ class ModelRunner:
 
                     stats = params.controller.train_batch(params.model, batch, one_hot_label)
                     with torch.no_grad():
-                        avg_loss += stats.loss / len(loader)
+                        avg_loss += avg_loss / len(loader)
 
-                    if (batch_idx % 50) == 0:
-                        self.log(f"Training: epoch [{epoch}/{params.controller.num_epochs()}] batch [{batch_idx}/{len(loader)}]")
-                        self.log(f"\tLoss : {stats.loss.item()}")
+                    if (batch_idx % 50) != 0:
+                        continue
+
+                    self.log(f"Training: epoch [{epoch}/{params.controller.num_epochs()}] batch [{batch_idx}/{len(loader)}]")
+                    self.log(f"\tLoss: {stats.loss.item()}")
+
+                    if stats.device_stats is None:
+                        continue
+                    
+                    self.log(f"\tGPU usage: {stats.device_stats.usage}%")
+                    self.log(f"\tGPU temperature: {stats.device_stats.temperature}C")
+                    self.log(f"\tGPU memory allocated: {(stats.device_stats.memory_allocated / (2 ** 30)):.2f}GB")
+
+                    if summary is not None:
+                        step = (epoch - 1) * len(loader) + batch_idx
+                        summary.add_scalar("Train/GPU usage(%)", stats.device_stats.usage, step)
+                        summary.add_scalar("Train/GPU temperature(C)", stats.device_stats.temperature, step)
+                        summary.add_scalar("Train/GPU memory allocated(GB)", stats.device_stats.memory_allocated / (2 ** 30), step)
 
                 if params.is_master():
                     torch.save({
@@ -334,12 +367,13 @@ class ModelRunner:
                 params.controller.step(eval_stats.loss)
 
                 if summary is not None:
-                    summary.add_scalar("Train loss", avg_loss, global_step=epoch)
-                    summary.add_scalar("Validation loss", eval_stats.loss, global_step=epoch)
-                    summary.add_image("Validation images(ground truth)", 
+                    summary.add_scalar("Train/loss", avg_loss, global_step=epoch)
+
+                    summary.add_scalar("Validation/loss", eval_stats.loss, global_step=epoch)
+                    summary.add_image("Validation/images(ground truth)", 
                                        vutils.make_grid(eval_stats.input_images.detach().cpu()), 
                                                global_step=epoch)
-                    summary.add_image("Validation images(generated)", 
+                    summary.add_image("Validation/images(generated)", 
                                        vutils.make_grid(eval_stats.generated_images.detach().cpu()), 
                                        global_step=epoch)
 
@@ -528,12 +562,13 @@ class VAEController(ModelController):
             generated, mu, logvar = model(batch)
 
             loss = self.loss_fn(batch, generated, mu, logvar)
+            device_stats = DeviceStats.capture(batch.device)
 
         self.scaler.scale(loss)
         nn.utils.clip_grad_norm_(self.vae.parameters(), max_norm=1)
         self.scaler.update(self.optimiser)
 
-        return RunStats(loss=loss, generated_images=generated)
+        return RunStats(loss=loss, generated_images=generated, device_stats=device_stats)
 
     
     def eval_batch(self, model: nn.Module, batch: Tensor, label: torch.Tensor) -> RunStats:
@@ -541,7 +576,7 @@ class VAEController(ModelController):
             generated, mu, logvar = model(batch)
 
             loss = self.loss_fn(batch, generated, mu, logvar)
-            return RunStats(loss=loss, generated_images=generated)
+            return RunStats(loss=loss, generated_images=generated, device_stats=DeviceStats.capture(batch.device))
 
 
     def model(self) -> nn.Module:
@@ -589,6 +624,8 @@ class DiffusionModelController(ModelController):
                                                          DiffusionModelForwardMode.TRAIN)
             loss = F.mse_loss(predict_eps, true_eps)
 
+        device_stats = DeviceStats.capture(batch.device)
+
         self.optimiser.zero_grad(set_to_none=True)
         self.scaler.scale(loss)
         self.scaler.update(self.optimiser)
@@ -599,8 +636,10 @@ class DiffusionModelController(ModelController):
                 predict_eps, 
                 t)
             images = self.vae.decode(latent_images)
+
         return RunStats(loss=loss, 
-                        generated_images=images)
+                        generated_images=images,
+                        device_stats=device_stats)
 
 
     @torch.inference_mode()
@@ -618,7 +657,8 @@ class DiffusionModelController(ModelController):
             images = self.vae.decode(latent_images)
             loss = F.mse_loss(batch, images)
             return RunStats(loss=loss, 
-                            generated_images=images)
+                            generated_images=images,
+                            device_stats=DeviceStats.capture(batch.device))
 
 
     def save_path(self) -> Path:
