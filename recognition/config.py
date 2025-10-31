@@ -1,8 +1,9 @@
+"""
+Configurations for models
+Definitions are in train.py
+"""
 from dataclasses import dataclass
 import typing
-
-
-T = typing.TypeVar("T")
 
 
 @dataclass(frozen=True)

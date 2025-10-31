@@ -1,3 +1,6 @@
+"""
+Loads image from ANDI dataset
+"""
 from torch.utils.data import Dataset
 from torchvision.transforms import v2
 from torchvision.io.image import decode_image
@@ -26,6 +29,9 @@ Item = tuple[torch.Tensor, int]
 
 
 class ImageListDataset(Dataset[Item]):
+    """
+    Wraps a partition that contains both AD and NC images
+    """
     def __init__(self, 
                  ad_images: list[Path],
                  cn_images: list[Path],
@@ -59,6 +65,9 @@ class ImageListDataset(Dataset[Item]):
 
 
 class ANDIDataset:
+    """
+    Defines train/test/validation partitions of the ANDI dataset
+    """
     def __init__(self, 
                  dataset_root: Path,
                  num_validation: int = 2000):
