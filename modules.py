@@ -449,7 +449,7 @@ class DiffusionModel(nn.Module):
         self.alpha_bars: torch.Tensor = self.alphas.cumprod(0)
 
         self.timesteps_projection = nn.Sequential(
-                nn.Linear(1, config.unet_config.embedding_dim),
+                nn.Linear(config.unet_config.embedding_dim, config.unet_config.embedding_dim),
                 nn.SiLU(inplace=True),
                 nn.Linear(config.unet_config.embedding_dim, config.unet_config.embedding_dim)
         )
@@ -506,10 +506,7 @@ class DiffusionModel(nn.Module):
 
 
     @torch.inference_mode()
-    def generate(self, image_info: ImageInfo, label: torch.Tensor) -> torch.Tensor:
-        x_t = torch.normal(0, 1, 
-                             size=(image_info.depth, *image_info.size), device=label.device)
-
+    def denoise(self, x_t: torch.Tensor, label: torch.Tensor):
         for t in reversed(range(self.timesteps.size(0))):
             timestep = torch.full(label.shape, t, device=label.device)
             embedding = self.embed_from_label(label, timestep)
@@ -517,6 +514,13 @@ class DiffusionModel(nn.Module):
             x_t = self.denoise_step(x_t, eps_t, t)
 
         return x_t
+
+
+    @torch.inference_mode()
+    def generate(self, image_info: ImageInfo, label: torch.Tensor) -> torch.Tensor:
+        x_t = torch.normal(0, 1, 
+                             size=(image_info.depth, *image_info.size), device=label.device)
+        return self.denoise(x_t, label)
 
 
     def add_noise_step(self, x_t: torch.Tensor, t: int):
@@ -533,7 +537,7 @@ class DiffusionModel(nn.Module):
 
     def add_noise(self, batch: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         eps = torch.normal(0, 1, size=batch.shape, device=batch.device)
-        alpha_bar = self.alpha_bars[t].view(t.size(0), 1, 1, 1)
+        alpha_bar = self.alpha_bars[t].view(batch.size(0), 1, 1, 1)
         x_t = alpha_bar.sqrt() * batch + (1 - alpha_bar).sqrt() * eps
         return x_t, eps
 
