@@ -111,7 +111,6 @@ class PortableGradScaler:
         if self.scaler is not None:
             self.scaler.step(optimiser)
             self.scaler.update()
-            optimiser.zero_grad(set_to_none=True)
 
 
 @dataclass(frozen=True)
@@ -622,6 +621,8 @@ class VAEController(ModelController):
 
 
     def train_batch(self, model: nn.Module, batch: Tensor, label: torch.Tensor) -> TrainBatchStats:
+        self.optimiser.zero_grad(set_to_none=True)
+
         with torch.autocast(device_type=batch.device.type):
             generated, mu, logvar = model(batch)
 
@@ -690,6 +691,7 @@ class DiffusionModelController(ModelController):
     def train_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> TrainBatchStats:
         self.vae.eval()
 
+        self.optimiser.zero_grad(set_to_none=True)
         with torch.autocast(device_type=batch.device.type):
             with torch.no_grad():
                 latent = self.vae.encode(batch)
