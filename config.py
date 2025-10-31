@@ -9,11 +9,15 @@ T = typing.TypeVar("T")
 class EncoderDecoderConfig:
     num_channels: typing.Sequence[int]
     should_downsample: typing.Sequence[bool]
+    use_attention: typing.Sequence[bool]
     num_resnet_blocks: int
     num_attention_heads: int
     layer_norm_num_groups: int
-    use_attention_in_up_down_sampling: bool
     embedding_dim: typing.Optional[int]
+
+
+    def num_attention_heads_for_block(self, block: int) -> typing.Optional[int]:
+        return self.num_attention_heads if self.use_attention[block] else None
 
 
 @dataclass(frozen=True)

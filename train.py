@@ -47,7 +47,7 @@ VAE_CONFIG = VAEConfig(
         num_attention_heads=2,
         layer_norm_num_groups=32,
         embedding_dim=None,
-        use_attention_in_up_down_sampling=False
+        use_attention=(False,) * 4
     ),
     latent_dim=4,
     weight_decay=1e-6,
@@ -76,8 +76,8 @@ DIFFUSION_CONFIG = DiffusionConfig(
         num_resnet_blocks=2,
         num_attention_heads=2,
         layer_norm_num_groups=32,
-        use_attention_in_up_down_sampling=True,
-        embedding_dim=320
+        embedding_dim=320,
+        use_attention=(True,) * 4
     )
 )
 

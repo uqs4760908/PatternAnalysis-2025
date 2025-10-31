@@ -11,12 +11,6 @@ import typing
 import abc
 
 
-try:
-    import flash_attn
-except ImportError:
-    flash_attn = None
-
-
 class SequentialWithEmbedding(nn.ModuleList):
     def __init__(self, *layers: nn.Module):
         super().__init__(layers)
@@ -34,6 +28,35 @@ class ResNetBlockInfo:
     out_channels: int
     layer_norm_num_groups: int
     embedding_dim: typing.Optional[int]
+    num_attention_heads: typing.Optional[int]
+
+
+class PixelTransformer(nn.Module):
+    def __init__(self, 
+                 num_channels: int, 
+                 num_heads: int, 
+                 layer_norm_num_groups: int):
+        super().__init__()
+
+        if num_channels % num_heads != 0:
+            raise ValueError(f"num_channels({num_channels}) must be divisable by num_heads({num_heads})")
+        self.qkv_projection = nn.Conv2d(num_channels, num_channels * 3, kernel_size=1)
+        self.num_heads = num_heads
+        self.norm = nn.GroupNorm(num_groups=layer_norm_num_groups, num_channels=num_channels)
+        self.net = nn.MultiheadAttention(num_channels, num_heads, batch_first=True)
+        self.project_out = nn.Conv2d(num_channels, num_channels, kernel_size=1)
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        norm = self.norm(images)
+        batch, channels, height, width = images.shape
+        qkv = self.qkv_projection(norm) # shape: (batch, channels * 3, height, width)
+
+        q, k, v = (t.view(batch, channels, height * width).transpose(1, 2) 
+                   for t in qkv.chunk(3, 1))
+        patches: torch.Tensor = self.net(q, k, v, need_weights=False)[0]
+        patches = patches.transpose(1, 2).view(batch, channels, height, width)
+        patches = self.project_out(patches)
+        return images + patches
 
 
 class ResNetBlock(nn.Module):
@@ -41,37 +64,34 @@ class ResNetBlock(nn.Module):
         super().__init__()
 
         self.input_net = nn.Sequential(
+                nn.GroupNorm(
+                    num_groups=info.layer_norm_num_groups, 
+                    num_channels=info.in_channels),
+                nn.SiLU(inplace=True),
                 nn.Conv2d(
                         in_channels=info.in_channels, 
                         out_channels=info.out_channels, 
                         kernel_size=3, 
                         padding=1, 
                         bias=False),
+        )
+        self.output_net = nn.Sequential(
                 nn.GroupNorm(
                     num_groups=info.layer_norm_num_groups, 
                     num_channels=info.out_channels),
-                nn.SiLU(inplace=True)
-        )
-        self.output_net = nn.Sequential(
+                nn.SiLU(inplace=True),
                 nn.Conv2d(
                     in_channels=info.out_channels, 
                     out_channels=info.out_channels, 
                     kernel_size=3, 
                     padding=1, 
                     bias=False),
-                nn.GroupNorm(
-                    num_groups=info.layer_norm_num_groups, 
-                    num_channels=info.out_channels)
         )
 
         if info.embedding_dim is not None:
             self.embedding_projection_net = nn.Sequential(
-                nn.Linear(
-            info.embedding_dim,
-            info.out_channels
-                ),
-                nn.SiLU(inplace=True),
-                nn.Linear(info.out_channels, info.out_channels)
+                nn.SiLU(),
+                nn.Linear(info.embedding_dim, info.out_channels),
             )
         else:
             self.embedding_projection_net = None
@@ -83,6 +103,13 @@ class ResNetBlock(nn.Module):
                     kernel_size=1)
         else:
             self.skip_connection: nn.Module = nn.Identity()
+
+        if info.num_attention_heads:
+            self.attention = PixelTransformer(
+                    info.out_channels, info.num_attention_heads, 
+                    info.layer_norm_num_groups)
+        else:
+            self.attention = nn.Identity()
 
     
     def forward(self, batch: torch.Tensor, embedding: typing.Optional[torch.Tensor]=None) -> torch.Tensor:
@@ -96,8 +123,8 @@ class ResNetBlock(nn.Module):
             raise Exception()
 
         skipped: torch.Tensor = self.skip_connection(batch)
-        output = self.output_net(output)
-        return F.silu(output + skipped)
+        output = self.output_net(output) + skipped
+        return self.attention(output)
 
 
 class ResNetBlockList(SequentialWithEmbedding):
@@ -109,36 +136,6 @@ class ResNetBlockList(SequentialWithEmbedding):
         )
 
 
-class PixelTransformer(nn.Module):
-    def __init__(self, num_channels: int, num_heads: int):
-        super().__init__()
-
-        if num_channels % num_heads != 0:
-            raise ValueError(f"num_channels({num_channels}) must be divisable by num_heads({num_heads})")
-        self.qkv_projection = nn.Conv2d(num_channels, num_channels * 3, kernel_size=1)
-        self.num_heads = num_heads
-
-        if flash_attn is None:
-            self.net = nn.MultiheadAttention(num_channels, num_heads)
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        batch, channels, height, width = images.shape
-        images = self.qkv_projection(images) # shape: (batch, channels * 3, height, width)
-        images = images.view(batch, 3, self.num_heads, channels // self.num_heads, height * width).permute(0, 4, 1, 2, 3)
-
-        if flash_attn is not None:
-            patches = typing.cast(torch.Tensor, flash_attn.flash_attn_qkvpacked_func(images))
-            patches = patches.view(batch, height * width, channels).transpose(1, 2)
-
-            return patches.view(batch, channels, height, width)
-
-
-        q, k, v = (t.view(batch, channels, height * width).transpose(1, 2) 
-                   for t in images.chunk(3, 1))
-        patches: torch.Tensor = self.net(q, k, v, need_weights=False)[0]
-        return patches.transpose(1, 2).view(batch, channels, height, width)
-
-
 class EncoderStage(nn.Module):
     def __init__(self, stage_index: int, config: EncoderDecoderConfig):
         super().__init__()
@@ -148,24 +145,17 @@ class EncoderStage(nn.Module):
             in_channels=channels[stage_index],
             out_channels=channels[stage_index + 1],
             layer_norm_num_groups=config.layer_norm_num_groups,
-            embedding_dim=config.embedding_dim
+            embedding_dim=config.embedding_dim,
+            num_attention_heads=config.num_attention_heads_for_block(stage_index)
         )
         self.resnet_list = ResNetBlockList(
         config.num_resnet_blocks,
             info
         )
 
-        if config.use_attention_in_up_down_sampling:
-            self.transformer = PixelTransformer(
-                    info.out_channels, 
-                    config.num_attention_heads)
-        else:
-            self.transformer = nn.Identity()
-
 
     def conv(self, batch: torch.Tensor, embedding: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
         output = self.resnet_list(batch, embedding)
-        output = self.transformer(output)
         return output
 
 
@@ -229,7 +219,8 @@ class VAE(nn.Module, Autoencoder):
                     in_channels=channels[i + 1],
                     out_channels=channels[i],
                     layer_norm_num_groups=config.encoder_decoder_config.layer_norm_num_groups,
-                    embedding_dim=config.encoder_decoder_config.embedding_dim
+                    embedding_dim=config.encoder_decoder_config.embedding_dim,
+                    num_attention_heads=config.encoder_decoder_config.num_attention_heads_for_block(i)
                 )
             )
             decoder_layers.append(resblocks)
@@ -323,7 +314,8 @@ class UNetUpsampler(nn.Module):
                     in_channels=channels[stage] + channels[stage + 1],
                     out_channels=channels[stage],
                     layer_norm_num_groups=config.layer_norm_num_groups,
-                    embedding_dim=config.embedding_dim
+                    embedding_dim=config.embedding_dim,
+                    num_attention_heads=config.num_attention_heads_for_block(stage)
                 )
         )
 
@@ -337,7 +329,8 @@ class UNet(nn.Module):
         self.downsample_projection = nn.Conv2d(
             in_channels=latent_channels,
             out_channels=config.unet_config.num_channels[0],
-            kernel_size=1,
+            kernel_size=3,
+            padding=1
         )
         self.downsample_passes = nn.ModuleList([
             EncoderStage(i, config.unet_config) 
@@ -349,12 +342,14 @@ class UNet(nn.Module):
             in_channels=config.unet_config.num_channels[-1],
             out_channels=config.unet_config.num_channels[-1],
             layer_norm_num_groups=config.unet_config.layer_norm_num_groups,
-            embedding_dim=config.unet_config.embedding_dim
+            embedding_dim=config.unet_config.embedding_dim,
+            num_attention_heads=None
         )
         self.mid_resnet1 = ResNetBlock(info)
         self.mid_pixel_transformer = PixelTransformer(
             num_channels=info.out_channels,
-            num_heads=config.unet_config.num_attention_heads
+            num_heads=config.unet_config.num_attention_heads,
+            layer_norm_num_groups=config.unet_config.layer_norm_num_groups
         )
         self.mid_resnet2 = ResNetBlock(info)
 
@@ -362,10 +357,15 @@ class UNet(nn.Module):
             UNetUpsampler(i, config=config.unet_config)
                 for i in reversed(range(len(config.unet_config.num_channels) - 1))
         ])
-        self.upsample_projection = nn.Conv2d(
-                in_channels=config.unet_config.num_channels[0],
-                out_channels=latent_channels,
-                kernel_size=1
+        self.upsample_projection = nn.Sequential(
+            nn.SiLU(inplace=True),
+            nn.GroupNorm(config.unet_config.layer_norm_num_groups, config.unet_config.num_channels[0]),
+            nn.Conv2d(
+                    in_channels=config.unet_config.num_channels[0],
+                    out_channels=latent_channels,
+                    kernel_size=3,
+                    padding=1
+            )
         )
 
 
@@ -506,8 +506,8 @@ class DiffusionModel(nn.Module):
         x_0 = alpha_bar_t.rsqrt() * (x_t - (1 - alpha_bar_t).sqrt() * eps_t)
         x_0 = x_0.clamp(-1, 1)
         x_0_coeff = alpha_bar_t_prev.sqrt() * beta_t / (1 - alpha_bar_t)
-
         x_t_coeff = alpha_t.sqrt() * (1 - alpha_bar_t_prev) / (1 - alpha_bar_t)
+
         mu_t = x_0_coeff * x_0 + x_t_coeff * x_t
 
         x_t = mu_t
