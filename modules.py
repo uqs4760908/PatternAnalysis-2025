@@ -2,6 +2,7 @@ from torch import nn
 from torch.nn import functional as F
 from config import VAEConfig, ImageInfo, DiffusionConfig
 from enum import Enum
+from torchvision.models import inception_v3, Inception_V3_Weights
 import torch
 import typing
 import abc
@@ -95,6 +96,8 @@ class ResNetBlock(nn.Module):
             embedding_projection: torch.Tensor = self.embedding_projection_net(embedding)
             embedding_projection = embedding_projection.view(*embedding_projection.shape[:2], 1, 1)
             output = output + embedding_projection
+        elif self.embedding_projection_net is not None and embedding is None:
+            raise Exception()
 
         skipped: torch.Tensor = self.skip_connection(batch)
         output = self.output_net(output)
@@ -128,7 +131,6 @@ class PixelTransformer(nn.Module):
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         batch, channels, height, width = images.shape
         images = self.qkv_projection(images)
-        qkv = images.view(batch, channels * 3, height * width).transpose(1, 2)
 
         q, k, v = (t.view(batch, channels, height * width).transpose(1, 2) 
                    for t in images.chunk(3, 1))
@@ -468,24 +470,24 @@ class UNet(nn.Module):
                 num_classes,
                 should_downsample_in_block=config.should_downsample_in_block
         )
-        self.middle = nn.Sequential(
-                ResNetBlock(
-                    config.num_channels[-1],
-                    config.num_channels[-1],
-                    num_groups=config.layer_norm_num_groups,
-                    embedding_dim=num_classes
-                ),
-                PixelTransformer(
-                    config.num_channels[-1],
-                    num_heads=config.num_attention_heads
-                ),
-                ResNetBlock(
-                    config.num_channels[-1],
-                    config.num_channels[-1],
-                    num_groups=config.layer_norm_num_groups,
-                    embedding_dim=num_classes
-                ),
+
+        self.mid_resnet1 = ResNetBlock(
+            config.num_channels[-1],
+            config.num_channels[-1],
+            num_groups=config.layer_norm_num_groups,
+            embedding_dim=num_classes
         )
+        self.mid_pixel_transformer = PixelTransformer(
+            config.num_channels[-1],
+            num_heads=config.num_attention_heads
+        )
+        self.mid_resnet2 = ResNetBlock(
+            config.num_channels[-1],
+            config.num_channels[-1],
+            num_groups=config.layer_norm_num_groups,
+            embedding_dim=num_classes
+        )
+
         self.upsample = UpsamplePass(
                 latent_channels,
                 config.num_channels,
@@ -500,8 +502,10 @@ class UNet(nn.Module):
 
     def forward(self, batch: torch.Tensor, embedding: torch.Tensor) -> torch.Tensor:
         output: torch.Tensor = self.downsample(batch, embedding)
-        output = self.middle(output)
-        output = self.upsample(output)
+        output = self.mid_resnet1(output, embedding)
+        output = self.mid_pixel_transformer(output)
+        output = self.mid_resnet2(output, embedding)
+        output = self.upsample(output, embedding)
         return output
 
 
@@ -614,3 +618,28 @@ class DiffusionModel(nn.Module):
             t = torch.full((batch.size(0),), 
                            self.denoise_steps - 1, device=batch.device)
             return self.reconstruct(batch, label, t)
+
+
+class FIDInception(nn.Module):
+    FEATURE_MAP_SIZE = 2048
+
+    def __init__(self):
+        super().__init__()
+        self.inception = inception_v3(Inception_V3_Weights.DEFAULT)
+        self.inception.fc = nn.Identity() # type:ignore
+
+
+    @staticmethod
+    def fid_score(mu1: torch.Tensor, mu2: torch.Tensor, sigma1: torch.Tensor, sigma2: torch.Tensor):
+        mu_dist = F.mse_loss(mu1, mu2, reduction="sum")
+        sigma12 = sigma1.mm(sigma2)
+        eigvec, eigval = torch.linalg.eig(sigma12)
+        eigval = eigval.sqrt()
+        sigma12_sqrt = eigvec.mm(eigval).mm(eigvec.T)
+
+        sigma_trace = torch.trace(sigma1 + sigma2 - 2 * sigma12_sqrt)
+        return mu_dist + sigma_trace
+
+
+    def forward(self, batch: torch.Tensor) -> torch.Tensor:
+        return self.inception(batch)
