@@ -185,7 +185,8 @@ class VAE(nn.Module, Autoencoder):
         self.project_channels = nn.Conv2d(
                         in_channels=image_info.depth,
                         out_channels=config.encoder_decoder_config.num_channels[0],
-                        kernel_size=1
+                        kernel_size=3,
+                        padding=1
                     )
         self.encoder = nn.ModuleList(
             [
@@ -195,11 +196,16 @@ class VAE(nn.Module, Autoencoder):
         )
 
         self.should_downsample = config.encoder_decoder_config.should_downsample
-        self.feature_to_mean_logvar = nn.Conv2d(
-                in_channels=config.encoder_decoder_config.num_channels[-1],
-                out_channels=config.latent_dim * 2,
-                kernel_size=3,
-                padding=1
+        self.feature_to_mean_logvar = nn.Sequential(
+                nn.GroupNorm(config.encoder_decoder_config.layer_norm_num_groups, 
+                             config.encoder_decoder_config.num_channels[-1]),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(
+                        in_channels=config.encoder_decoder_config.num_channels[-1],
+                        out_channels=config.latent_dim * 2,
+                        kernel_size=3,
+                        padding=1
+                    ),
         )
         self.mean_logvar_to_feature = nn.Conv2d(
                 in_channels=config.latent_dim,
@@ -238,6 +244,9 @@ class VAE(nn.Module, Autoencoder):
 
         self.decoder = nn.Sequential(
                 *decoder_layers,
+                nn.GroupNorm(config.encoder_decoder_config.layer_norm_num_groups,
+                             channels[0]),
+                nn.SiLU(inplace=True),
                 nn.Conv2d(
                     in_channels=channels[0],
                     out_channels=image_info.depth,
@@ -504,7 +513,7 @@ class DiffusionSampler(nn.Module):
         alpha_t = 1 - beta_t
 
         x_0 = alpha_bar_t.rsqrt() * (x_t - (1 - alpha_bar_t).sqrt() * eps_t)
-        x_0 = x_0.clamp(-1, 1)
+        #x_0 = x_0.clamp(-1, 1)
         x_0_coeff = alpha_bar_t_prev.sqrt() * beta_t / (1 - alpha_bar_t)
         x_t_coeff = alpha_t.sqrt() * (1 - alpha_bar_t_prev) / (1 - alpha_bar_t)
         
