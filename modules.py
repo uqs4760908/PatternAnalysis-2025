@@ -428,15 +428,16 @@ class DiffusionModel(nn.Module):
         out = torch.empty((timesteps.size(0), embedding_size), device=timesteps.device)
         # The bitand -2 rounds odd elements down to the closest even
         # This extracts 'i'(in the formula above) from 0..N
-        denom = torch.exp(-math.log(10000) * 2 * (torch.arange(0, embedding_size) & -2) / embedding_size)
+        i = torch.arange(0, embedding_size) & -2
+        denom = torch.exp(-math.log(10000) * i / embedding_size)
         numerator = timesteps.reshape(timesteps.size(0), 1)
         angles = numerator * denom
 
-        odds = angles[1::2]
-        evens = angles[::2]
+        odds = angles[..., 1::2]
+        evens = angles[..., ::2]
         
-        out[::2] = torch.sin(evens)
-        out[1::2] = torch.cos(odds)
+        out[..., ::2] = torch.sin(evens)
+        out[..., 1::2] = torch.cos(odds)
         return out
 
 
