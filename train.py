@@ -164,6 +164,10 @@ class ModelController(abc.ABC):
 
 
     @abc.abstractmethod
+    def name(self) -> str: ...
+
+
+    @abc.abstractmethod
     def num_epochs(self) -> int: ...
 
 
@@ -592,6 +596,10 @@ class VAEController(ModelController):
         self.scheduler.step(loss)
 
 
+    def name(self) -> str:
+        return "VAE"
+
+
     def get_lr(self) -> float:
         return self.scheduler.get_last_lr()[0]
 
@@ -651,6 +659,10 @@ class DiffusionModelController(ModelController):
         return 30
 
 
+    def name(self) -> str:
+        return "Diffusion"
+
+
     def dependent_models(self) -> typing.Sequence[nn.Module]:
         return (self.vae,)
 
@@ -672,6 +684,8 @@ class DiffusionModelController(ModelController):
             t, true_eps, predict_eps, noisy_image = model(latent, 
                                                          label, 
                                                          DiffusionModelForwardMode.TRAIN)
+            print(true_eps)
+            print(predict_eps)
             loss = F.mse_loss(predict_eps, true_eps)
 
         device_stats = DeviceStats.capture(batch.device)
@@ -693,7 +707,8 @@ class DiffusionModelController(ModelController):
 
             latent_images = self.diffusion_model.predicted_noise_to_image(
                 noisy_image, 
-                predict_eps, 
+                #predict_eps, 
+                true_eps,
                 t)
             images = self.vae.decode(latent_images)
             loss = F.mse_loss(batch, images)
