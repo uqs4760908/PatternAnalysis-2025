@@ -1,3 +1,5 @@
+import math
+from os import times
 from torch import nn
 from torch.nn import functional as F
 from config import EncoderDecoderConfig, VAEConfig, ImageInfo, DiffusionConfig
@@ -419,11 +421,16 @@ class DiffusionModel(nn.Module):
     @staticmethod
     @torch.no_grad
     def generate_timesteps_embeddings(timesteps: torch.Tensor, embedding_size: int):
+        # Positional embedding:
+        # PE(pos, 2i) = sin(pos / 10000*(2i/d))
+        # PE(pos, 2i + 1) = cos(pos / 10000*(2i/d))
+        # Compute it in log space since 10000*(2i/d) is too large
         out = torch.empty((timesteps.size(0), embedding_size), device=timesteps.device)
-
-        denomator = torch.pow(timesteps.size(0), 2 * (torch.arange(0, embedding_size) & -2))
+        # The bitand -2 rounds odd elements down to the closest even
+        # This extracts 'i'(in the formula above) from 0..N
+        denom = torch.exp(-math.log(timesteps.size(0)) * 2 * (torch.arange(0, embedding_size) & -2) / embedding_size)
         numerator = timesteps.reshape(timesteps.size(0), 1)
-        angles = numerator / denomator
+        angles = numerator * denom
 
         odds = angles[1::2]
         evens = angles[::2]
@@ -508,7 +515,7 @@ class DiffusionModel(nn.Module):
     @torch.inference_mode()
     def denoise(self, x_t: torch.Tensor, label: torch.Tensor):
         for t in reversed(range(self.timesteps.size(0))):
-            timestep = torch.full(label.shape, t, device=label.device)
+            timestep = torch.full((label.size(0), 1), t, device=label.device)
             embedding = self.embed_from_label(label, timestep)
             eps_t = self.unet(x_t, embedding)
             x_t = self.denoise_step(x_t, eps_t, t)
