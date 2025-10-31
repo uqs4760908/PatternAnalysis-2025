@@ -1,3 +1,7 @@
+"""
+Implements the train loop for VAE and DiffusionModel
+Also handles logging and checkpointing
+"""
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from config import DiffusionConfig, EncoderDecoderConfig, ImageInfo, VAEConfig
@@ -94,8 +98,10 @@ def get_accelerator():
 
 
 class PortableGradScaler:
+    """
+    torch.GradScaler is only availbale for cpu and cuda, disable it on other devices
+    """
     def __init__(self):
-        # GradScaler is only availbale for cpu and cuda
         accelerator = get_accelerator()
         if accelerator.type in ("cuda", "cpu"):
             self.scaler = GradScaler(accelerator.type)
@@ -191,7 +197,11 @@ class ModelController(abc.ABC):
 
 
     @abc.abstractmethod
-    def step(self, loss: Tensor) -> None: ...
+    def step(self, loss: Tensor) -> None:
+        """
+        Call after each epoch. Update scheduler and other per epoch state here
+        """
+        ...
 
 
     @abc.abstractmethod
@@ -207,7 +217,13 @@ class ModelController(abc.ABC):
 
     
     @abc.abstractmethod
-    def generate(self, n: int, batch: Tensor, label: Tensor) -> dict[str, Tensor]: ...
+    def generate(self, n: int, batch: Tensor, label: Tensor) -> dict[str, Tensor]:
+        """
+        Generate some images.
+        Designed for DiffusionModel, since running full diffusion is expensive.
+        This is only called once after validation.
+        """
+        ...
 
     
     @abc.abstractmethod
@@ -257,6 +273,7 @@ class ModelRunner:
             color = ""
             clear = ""
 
+        # Format to prevent it from interleaving with output from another process
         io = StringIO()
         print(f"[{color}INFO{clear}]{rank}", *args, file=io)
         print(io.getvalue(), end="")
@@ -294,6 +311,9 @@ class ModelRunner:
         
     
     def batch_size(self, controller: ModelController, model: nn.Module, device: torch.device) -> int:
+        """
+        Detect maximum batch size possible on a GPU
+        """
         if device in self.batch_size_cache:
             return self.batch_size_cache[device]
         image = self.dataset.train_dataset[0][0]
@@ -341,7 +361,8 @@ class ModelRunner:
 
     def make_dataloader(self, params: RunModelParams, epoch: int):
         if params.dist_params is not None:
-            sampler=DistributedSampler(params.dataset, shuffle=True)
+            # Must call set_epoch before constructing DataLoader or set_epoch will have no effect
+            sampler = DistributedSampler(params.dataset, shuffle=True)
             sampler.set_epoch(epoch)
         else:
             sampler = None

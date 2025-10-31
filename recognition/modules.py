@@ -1,3 +1,9 @@
+"""
+Defines VAE and DiffusionModel, as well as other components used
+
+Each component receive output of a Linear/Conv2d layer.
+Therefore each component should start by a GroupNorm and SiLU layer
+"""
 import math
 from torch import nn
 from torch.nn import functional as F
@@ -11,6 +17,9 @@ import abc
 
 
 class SequentialWithEmbedding(nn.ModuleList):
+    """
+    Similar to nn.Sequential, but passes embedding to sublayers
+    """
     def __init__(self, *layers: nn.Module):
         super().__init__(layers)
 
@@ -31,6 +40,9 @@ class ResNetBlockInfo:
 
 
 class PixelTransformer(nn.Module):
+    """
+    Self attention on each pixel
+    """
     def __init__(self, 
                  num_channels: int, 
                  num_heads: int, 
@@ -59,6 +71,11 @@ class PixelTransformer(nn.Module):
 
 
 class ResNetBlock(nn.Module):
+    """
+    Consists of 2 Conv2d + GroupNorm + SiLU block
+    A skipped connection connects input to output
+    Embedding is injected to the network here
+    """
     def __init__(self, info: ResNetBlockInfo):
         super().__init__()
 
@@ -118,8 +135,6 @@ class ResNetBlock(nn.Module):
             embedding_projection: torch.Tensor = self.embedding_projection_net(embedding)
             embedding_projection = embedding_projection.view(*embedding_projection.shape[:2], 1, 1)
             output = output + embedding_projection
-        elif self.embedding_projection_net is not None and embedding is None:
-            raise Exception()
 
         skipped: torch.Tensor = self.skip_connection(batch)
         output = self.output_net(output) + skipped
@@ -127,6 +142,9 @@ class ResNetBlock(nn.Module):
 
 
 class ResNetBlockList(SequentialWithEmbedding):
+    """
+    Usually more than 1 ResNetBlock is used per resolution. This construct all of them
+    """
     def __init__(self, num_blocks: int, info: ResNetBlockInfo):
         inner_info = dataclasses.replace(info, in_channels=info.out_channels)
         super().__init__(
@@ -136,6 +154,11 @@ class ResNetBlockList(SequentialWithEmbedding):
 
 
 class EncoderStage(nn.Module):
+    """
+    Pass input to a ResNetBlockList, then optionally downsample it
+
+    Side note: there is no DecoderStage because UNet has to handle skipped connection where VAE does not
+    """
     def __init__(self, stage_index: int, config: EncoderDecoderConfig):
         super().__init__()
 
@@ -169,15 +192,7 @@ class EncoderStage(nn.Module):
         return output, downsampled
 
 
-class Autoencoder(abc.ABC):
-    @abc.abstractmethod
-    def encode(self, image: torch.Tensor) -> torch.Tensor: ...
-
-    @abc.abstractmethod
-    def decode(self, latent_vector: torch.Tensor) -> torch.Tensor: ...
-
-
-class VAE(nn.Module, Autoencoder):
+class VAE(nn.Module):
     def __init__(self, config: VAEConfig, image_info: ImageInfo):
         super().__init__()
         
@@ -329,6 +344,10 @@ class UNetUpsampler(nn.Module):
 
 
 class UNet(nn.Module):
+    """
+    The UNet model, used to predict noise added in time t.
+    This can be used for latent diffusion or pixel diffusion.
+    """
     def __init__(self, 
                  config: DiffusionConfig, 
                  latent_channels: int):
@@ -409,18 +428,10 @@ class UNet(nn.Module):
         return output
 
 
-class DiffusionModelForwardMode(Enum):
-    """
-    Since we might wrap DiffusionModel in DistributedDataParallel,
-    the only entry point to DiffusionModel is forward(aka __call__)
-    During training, forward() samples a random t, where in inference
-    we want to run it over all steps
-    """
-    TRAIN = 0
-    EVAL = 1
-
-
 class DiffusionModel(nn.Module):
+    """
+    Encodes time and class embedding and pass it to UNet
+    """
     @staticmethod
     @torch.no_grad
     def generate_timesteps_embeddings(T: int, embedding_size: int):
@@ -482,6 +493,10 @@ class DiffusionModel(nn.Module):
 
 
 class DiffusionSampler(nn.Module):
+    """
+    Implements equation 4 and 7 in the DDPM paper to handles noise addition/removal
+    This module contains no learnable parameter.
+    """
     def __init__(self, config: DiffusionConfig):
         super().__init__()
 
