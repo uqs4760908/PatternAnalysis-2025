@@ -18,7 +18,6 @@ from torch.optim import AdamW, Optimizer
 from dataclasses import dataclass
 from io import StringIO
 import sys
-import functools
 import time
 import typing
 import abc
@@ -36,7 +35,7 @@ VAE_CONFIG = VAEConfig(
             1 * 128,
             2 * 128,
             4 * 128,
-            4 * 128
+            4 * 128 
         ),
         should_downsample=(
             True,
@@ -51,7 +50,7 @@ VAE_CONFIG = VAEConfig(
         use_attention=(False,) * 4
     ),
     latent_dim=4,
-    weight_decay=1e-6,
+    weight_decay=1e-5,
 )
 
 DIFFUSION_CONFIG = DiffusionConfig(
@@ -237,6 +236,7 @@ class ModelRunner:
     """
     def __init__(self):
         self.dataset = ANDIDataset(Path("./data"))
+        self.batch_size_cache: dict[torch.device, int] = {}
 
 
     def log(self, *args):
@@ -246,8 +246,8 @@ class ModelRunner:
             rank = ""
 
         if sys.stdout.isatty():
-            color = "\033[42m"
-            clear = "\033[0m"
+            color = "\033[42m" #] <-- fix neovim indentation bug
+            clear = "\033[0m" #]
         else:
             color = ""
             clear = ""
@@ -270,6 +270,7 @@ class ModelRunner:
             return
 
         store = dist.FileStore(file, world_size) # type:ignore
+        torch.accelerator.set_device_index(rank)
         backend = dist.get_default_backend_for_device(device)
         dist.init_process_group(backend, store=store, rank=rank, world_size=world_size, device_id=rank)
         try:
@@ -287,13 +288,14 @@ class ModelRunner:
             torch.mps.synchronize()
         
     
-    @functools.cache
     def batch_size(self, controller: ModelController, model: nn.Module, device: torch.device) -> int:
+        if device in self.batch_size_cache:
+            return self.batch_size_cache[device]
         image = self.dataset.train_dataset[0][0]
 
         batch_size = 1
 
-        for size in (2, 4, 8, 16, 32, 64):
+        for size in (2, 4, 8, 16):
             try:
                 # It is possible that size just fit on device, and once we/some other process allocates 
                 # some more memory allocation will fail
@@ -308,6 +310,7 @@ class ModelRunner:
             except torch.OutOfMemoryError:
                 break
 
+        self.batch_size_cache[device] = batch_size
         return batch_size
 
 
@@ -363,7 +366,7 @@ class ModelRunner:
             last_loss = float("inf")
 
             train_start = time.time()
-            for epoch in range(1, 2):
+            for epoch in range(1, params.controller.num_epochs() + 1):
                 params.controller.prepare_train()
                 params.model.train()
 
@@ -625,8 +628,8 @@ class VAEController(ModelController):
 
     @staticmethod
     def loss_fn(image: Tensor, generated: Tensor, mu: Tensor, logvar: Tensor) -> Tensor:
-        reconstruction: Tensor = F.mse_loss(image, generated, reduction="sum")
-        kld: Tensor = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        reconstruction: Tensor = F.mse_loss(image, generated, reduction="none").sum(dim=[1, 2, 3]).mean()
+        kld: Tensor = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=[1, 2, 3]).mean()
 
         return reconstruction + kld
 
