@@ -352,7 +352,7 @@ class ModelRunner:
 
                     stats = params.controller.train_batch(params.model, batch, one_hot_label)
                     with torch.no_grad():
-                        avg_loss += avg_loss / len(loader)
+                        avg_loss += stats.loss / len(loader)
 
                     if (batch_idx % 50) != 0:
                         continue
