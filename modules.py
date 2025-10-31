@@ -504,7 +504,7 @@ class DiffusionSampler(nn.Module):
 
         # Coefficients for equation 7
         alpha_t_minus_one = torch.cat([torch.ones(1), alpha_bars])[:alpha_bars.size(0)]
-        beta_bars = (betas * (1 - alpha_t_minus_one) / (1 - alpha_bars))
+        beta_bars = betas * (1 - alpha_t_minus_one) / (1 - alpha_bars)
         self.beta_bars = nn.Embedding.from_pretrained(beta_bars.unsqueeze(1))
         x_0_coeff = alpha_t_minus_one.sqrt() * betas / (1 - alpha_bars)
         self.x_0_coeff = nn.Embedding.from_pretrained(x_0_coeff.unsqueeze(1))
@@ -513,6 +513,8 @@ class DiffusionSampler(nn.Module):
 
         # Coefficients for loss function
         loss_scales = beta_bars.square() / (2 * beta_bars * alphas * (1 - alpha_bars))
+        # loss_scales[0] is NaN because 1 - alpha_t_minus_one[0] is 0
+        loss_scales[0] = loss_scales[1]
         self.loss_scales = nn.Embedding.from_pretrained(loss_scales.unsqueeze(1))
 
 
