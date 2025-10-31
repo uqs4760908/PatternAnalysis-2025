@@ -1,6 +1,7 @@
 # Brain diffusion
 
 A latent diffusion model that generates brain images of people with normal cognitive and Alzheimer's Disease.
+Weights can be found [here](https://github.com/uqs4760908/PatternAnalysis-2025/releases/tag/v0.1.0).
 
 ## Table of contents
 
