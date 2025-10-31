@@ -516,7 +516,7 @@ class DiffusionModel(nn.Module):
     @torch.inference_mode()
     def denoise(self, x_t: torch.Tensor, label: torch.Tensor):
         for t in reversed(range(self.timesteps.size(0))):
-            timestep = torch.full((label.size(0), ), t, device=label.device)
+            timestep = torch.full((x_t.size(0), ), t, device=label.device)
             embedding = self.embed_from_label(label, timestep)
             eps_t = self.unet(x_t, embedding)
             x_t = self.denoise_step(x_t, eps_t, t)
@@ -525,9 +525,9 @@ class DiffusionModel(nn.Module):
 
 
     @torch.inference_mode()
-    def generate(self, size: tuple[int, int], latent_dim: int, label: torch.Tensor) -> torch.Tensor:
+    def generate(self, num_images: int, size: tuple[int, int], latent_dim: int, label: torch.Tensor) -> torch.Tensor:
         x_t = torch.normal(0, 1, 
-                             size=(1, latent_dim, *size), 
+                             size=(num_images, latent_dim, *size), 
                            device=label.device)
         return self.denoise(x_t, label)
 
