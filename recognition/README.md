@@ -287,7 +287,7 @@ Optional, for calculating FID score
 
 ## Environment requirements
 
-While this implementation is written in a mostly hardware-agnostic manner, it is only test on CUDA gpus.
+While this implementation is written in a mostly hardware-agnostic manner, it is only tested on CUDA gpus.
 
 This implementation is tested on Python 3.11 and 3.12.
 
