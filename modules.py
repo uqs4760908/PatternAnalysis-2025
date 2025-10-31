@@ -464,6 +464,7 @@ class DiffusionModel(nn.Module):
                 nn.SiLU(inplace=True),
                 nn.Linear(config.unet_config.embedding_dim, config.unet_config.embedding_dim)
         )
+        self.latent_scale_factor = config.latent_scale_factor
 
 
     def embed_from_label(self, label: typing.Optional[torch.Tensor], t: torch.Tensor) -> torch.Tensor:
@@ -478,12 +479,13 @@ class DiffusionModel(nn.Module):
 
 
     def forward(self, noise: torch.Tensor, t: torch.Tensor, label: typing.Optional[torch.Tensor]):
+        noise = noise * self.latent_scale_factor
         embedding = self.embed_from_label(label, t)
-        return self.unet(noise, embedding)
+        return self.unet(noise, embedding) / self.latent_scale_factor
 
 
 class DiffusionSampler(nn.Module):
-    def __init__(self, config: DiffusionConfig,):
+    def __init__(self, config: DiffusionConfig):
         super().__init__()
 
         assert config.unet_config.embedding_dim

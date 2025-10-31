@@ -78,7 +78,8 @@ DIFFUSION_CONFIG = DiffusionConfig(
         layer_norm_num_groups=32,
         embedding_dim=320,
         use_attention=(True,) * 4
-    )
+    ),
+    latent_scale_factor=0.18215
 )
 
 
