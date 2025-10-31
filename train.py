@@ -105,12 +105,16 @@ class PortableGradScaler:
     def scale(self, loss: Tensor):
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
 
     def update(self, optimiser: Optimizer):
         if self.scaler is not None:
             self.scaler.step(optimiser)
             self.scaler.update()
+        else:
+            optimiser.step()
 
 
 @dataclass(frozen=True)
