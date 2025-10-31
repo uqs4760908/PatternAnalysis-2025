@@ -203,6 +203,21 @@ Both train and validation loss are decreasing over time. Train loss is larger th
 
 ![Diffusion NC 3](assets/generated/nc-3-999.jpg)
 
+## Diffusion process
+
+The follow images show the diffusion process of generating a NC brain image at $t=900,800,...,0$
+
+![Diffusion 1](assets/diffusion-process/nc-0-99.jpg)
+![Diffusion 2](assets/diffusion-process/nc-0-199.jpg)
+![Diffusion 3](assets/diffusion-process/nc-0-299.jpg)
+![Diffusion 4](assets/diffusion-process/nc-0-399.jpg)
+![Diffusion 5](assets/diffusion-process/nc-0-499.jpg)
+![Diffusion 6](assets/diffusion-process/nc-0-599.jpg)
+![Diffusion 7](assets/diffusion-process/nc-0-699.jpg)
+![Diffusion 8](assets/diffusion-process/nc-0-799.jpg)
+![Diffusion 9](assets/diffusion-process/nc-0-899.jpg)
+![Diffusion 10](assets/diffusion-process/nc-0-999.jpg)
+
 ## Other attempts
 
 ### Overfitting
