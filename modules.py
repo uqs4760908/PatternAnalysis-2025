@@ -181,7 +181,8 @@ class DecoderStage(nn.Module):
                  num_heads: int,
                  use_attention: int,
                  embedding_dim: typing.Optional[int],
-                 should_upsample: tuple[bool, bool]):
+                 should_upsample: tuple[bool, bool],
+                 upsample_with_activation: bool = True):
         super().__init__()
 
         self.resnet_list = ResNetBlockList(num_resnet_blocks, 
@@ -195,20 +196,27 @@ class DecoderStage(nn.Module):
         else:
             self.transformer = nn.Identity()
 
-        self.upsampler = nn.Sequential(
-                nn.ConvTranspose2d(
-                    out_channels,
-                    out_channels,
-                    kernel_size=3,
-                    stride=(should_upsample[0] + 1, should_upsample[1] + 1),
-                    padding=1,
-                    output_padding=(int(should_upsample[0]), int(should_upsample[1])),
-                    bias=False
-                ),
+        upsample_layers: list[nn.Module] = [
+            nn.ConvTranspose2d(
+                out_channels,
+                out_channels,
+                kernel_size=3,
+                stride=(should_upsample[0] + 1, should_upsample[1] + 1),
+                padding=1,
+                output_padding=(int(should_upsample[0]), int(should_upsample[1])),
+                bias=False
+            ),
+        ]
+
+        # ugly hack for VAE, since its last layer does not need normalisation and activation
+        if upsample_with_activation:
+            upsample_layers.extend([
                 nn.GroupNorm(num_groups, out_channels),
                 nn.SiLU(inplace=True)
-        )
+            ])
 
+
+        self.upsampler = nn.Sequential(*upsample_layers)
 
 
     def forward(self, batch: torch.Tensor, embedding: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -242,7 +250,7 @@ class DownsamplePass(nn.Module):
             self.project_channels = nn.Conv2d(
                     in_channels,
                     num_channels[0],
-                    kernel_size=3,
+                    kernel_size=1,
                     padding=1)
         else:
             self.project_channels = nn.Identity()
@@ -321,7 +329,7 @@ class UpsamplePass(nn.Module):
             self.project_channels = nn.Conv2d(
                     num_channels[0],
                     out_channels,
-                    kernel_size=3,
+                    kernel_size=1,
                     padding=1
             )
         else:
@@ -362,20 +370,40 @@ class AutoDecoder(nn.Module):
         super().__init__()
 
         deep_num_channels = num_channels[-1]
+
+        # VAE's last upsampling layer should not have normalisation and SiLU activation
+        # Construct UpsamplePass for n-1 passes and construct DecoderStage manually to disable 
+        # normalisation and SiLU
         self.decoder = nn.Sequential(
                 ResNetBlock(deep_num_channels, deep_num_channels, 
                             layer_norm_num_groups, None),
                 PixelTransformer(deep_num_channels, num_attention_heads),
                 ResNetBlock(deep_num_channels, deep_num_channels, 
                             num_resnet_blocks, None),
-                UpsamplePass(out_channels,
-                             num_channels,
+                UpsamplePass(num_channels[1],
+                             num_channels[1:],
                              num_resnet_blocks,
                              layer_norm_num_groups,
                              num_attention_heads,
-                             (False,) * len(num_channels),
+                             (False,) * (len(num_channels) - 1),
                              None,
-                             should_upsample_in_block),
+                             should_upsample_in_block[1:]),
+                DecoderStage(
+                    num_channels[1],
+                    num_channels[0],
+                    num_resnet_blocks,
+                    layer_norm_num_groups,
+                    num_attention_heads,
+                    False,
+                    None,
+                    should_upsample_in_block[0],
+                    False
+                ),
+                nn.Conv2d(
+                    num_channels[0],
+                    out_channels,
+                    kernel_size=1,
+                ),
                 nn.Sigmoid()
         )
 
