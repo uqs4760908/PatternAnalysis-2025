@@ -16,6 +16,7 @@ from torch.nn import functional as F
 from torch.optim import Adam, Optimizer
 from dataclasses import dataclass
 from io import StringIO
+import sys
 import functools
 import time
 import typing
@@ -211,12 +212,19 @@ class ModelRunner:
 
     def log(self, *args):
         if dist.is_initialized():
-            rank = f" Rank [{dist.get_rank()}]:"
+            rank = f" Rank [{dist.get_rank()}] "
         else:
             rank = ""
 
+        if sys.stdout.isatty():
+            color = "\033[42m"
+            clear = "\033[0m"
+        else:
+            color = ""
+            clear = ""
+
         io = StringIO()
-        print(f"[\033[42mINFO\033[0m]{rank}", *args, file=io)
+        print(f"[{color}INFO{clear}]{rank}", *args, file=io, end="")
         print(io.getvalue())
 
 
