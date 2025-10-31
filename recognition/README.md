@@ -55,7 +55,7 @@ The dataset consists of images of normal cognitive(NC) and Alzheimer's Disease(A
 
 ## File structure
 
-* `config.py`: defines configuration parameters used by models
+* `config.py`: configures the models' architecture and hyperparameters
 * `dataset.py`: loads data from the dataset, and apply data augmentation
 * `modules.py`: defines the models and components used
 * `train.py`: contains the main train loop
