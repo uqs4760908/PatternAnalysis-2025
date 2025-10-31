@@ -598,7 +598,7 @@ class VAEStats:
 
 
 class VAEController(ModelController):
-    MODEL_PATH = "vae.pth"
+    MODEL_PATH = "vae.pt"
 
     def __init__(self, dataset: ANDIDataset):
         super().__init__()
