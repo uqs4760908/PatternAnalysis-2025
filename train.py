@@ -210,7 +210,11 @@ class ModelController(abc.ABC):
 
     
     @abc.abstractmethod
-    def save_path(self) -> Path: ...
+    def save_model(self): ...
+
+
+    @abc.abstractmethod
+    def load_model(self): ...
 
 
 @dataclass(frozen=True)
@@ -415,10 +419,7 @@ class ModelRunner:
                     # Note: do not use params.model here since it might be DistributedDataParallel
                     # When loading saved model we are loading params.controller.model(),
                     # so be consistent
-                    torch.save({
-                        TRAIN_STATUS_KEY: TRAIN_STATUS_TRAINING if epoch < params.controller.num_epochs() - 1 else TRAIN_STATUS_DONE,
-                        MODEL_PARAMS_KEY: params.controller.model().state_dict()
-                    }, params.controller.save_path())
+                    params.controller.save_model()
                     last_loss = float(eval_stats.loss.item())
 
                 if summary is not None:
@@ -435,18 +436,8 @@ class ModelRunner:
             train_end = time.time()
             self.log(f"Training done, took {train_end - train_start:.2} seconds")
 
-            state = torch.load(params.controller.save_path())[MODEL_PARAMS_KEY]
-
-            if dist.is_initialized():
-                dist.barrier()
-            
-            if params.is_master():
-                torch.save({
-                    TRAIN_STATUS_KEY: TRAIN_STATUS_DONE,
-                    MODEL_PARAMS_KEY: state
-                }, params.controller.save_path())
-
-            params.controller.model().load_state_dict(state)
+            # Load best model
+            params.controller.load_model()
             self.log(f"Testing...")
             self.train_eval(
                 train_params=params,
@@ -587,17 +578,13 @@ class ModelRunner:
 
     def train(self, controller: ModelController):
         model_name = type(controller.model()).__name__
-
-        if controller.save_path().exists():
-            state = torch.load(controller.save_path(), weights_only=True, map_location="cpu")
-            if isinstance(state, dict) and MODEL_PARAMS_KEY in state:
-                train_status = state.get(TRAIN_STATUS_KEY)
-                if train_status in (TRAIN_STATUS_TRAINING, TRAIN_STATUS_DONE):
-                    controller.model().load_state_dict(state[MODEL_PARAMS_KEY])
-
-                if train_status == TRAIN_STATUS_DONE:
-                    self.log(f"Loaded {model_name} from {controller.save_path()}")
-                    return
+        
+        try:
+            controller.load_model()
+            self.log(f"Loaded {model_name}")
+            return
+        except:
+            pass
 
         self.log(f"Training {model_name}")
         self.run_model(self.train_loop, 
@@ -612,6 +599,8 @@ class VAEStats:
 
 
 class VAEController(ModelController):
+    MODEL_PATH = "vae.pth"
+
     def __init__(self, dataset: ANDIDataset):
         super().__init__()
         self.vae = VAE(VAE_CONFIG, dataset.image_info)
@@ -644,10 +633,6 @@ class VAEController(ModelController):
 
     def get_lr(self) -> float:
         return self.scheduler.get_last_lr()[0]
-
-
-    def save_path(self) -> Path:
-        return Path("vae.pth")
 
 
     def train_batch(self, model: nn.Module, batch: Tensor, label: torch.Tensor) -> TrainBatchStats:
@@ -687,11 +672,21 @@ class VAEController(ModelController):
         return self.vae
 
 
+    def load_model(self):
+        self.vae.load_state_dict(torch.load(self.MODEL_PATH, weights_only=True))
+
+
+    def save_model(self):
+        torch.save(self.vae.state_dict(), self.MODEL_PATH)
+
+
 def compute_ema(avg_param: Tensor, model_param: Tensor, *_):
     return 0.999 * avg_param + (1 - 0.999) * model_param
 
 
 class DiffusionModelController(ModelController):
+    EMA_MODEL_PATH = "diffusion_model.pt"
+
     def __init__(self, vae: VAE, image_info: ImageInfo):
         super().__init__()
 
@@ -810,9 +805,13 @@ class DiffusionModelController(ModelController):
                 "Generate CN": self.vae.decode(nc_latent)
             }
 
+        
+    def load_model(self):
+        self.ema_model.load_state_dict(torch.load(self.EMA_MODEL_PATH, weights_only=True))
 
-    def save_path(self) -> Path:
-        return Path("diffusion.pth")
+
+    def save_model(self):
+        torch.save(self.ema_model.state_dict(), self.EMA_MODEL_PATH)
 
 
 def main():
