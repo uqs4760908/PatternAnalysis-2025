@@ -11,42 +11,48 @@ from config import ImageInfo
 
 ALZHEIMER_DISEASE = "AD"
 COGNITIVE_NORMAL = "NC"
-TRANSFORM = ToDtype(dtype=torch.float16, scale=True)
+TRANSFORM = ToDtype(dtype=torch.float32, scale=True)
 
 
-class ImageListDataset(Dataset[torch.Tensor]):
+AD_LABEL = 0
+NC_LABEL = 1
+Item = tuple[torch.Tensor, int]
+
+
+class ImageListDataset(Dataset[Item]):
     def __init__(self, 
-                 images: list[Path]):
+                 ad_images: list[Path],
+                 cn_images: list[Path]):
         super().__init__()
-        self.images = images
-        with Image.open(images[0]) as image:
+        self.ad_images = ad_images
+        self.cn_images = cn_images
+        with Image.open(ad_images[0]) as image:
             # PIL specifies size in (width, height). We want (height, width)
             self.size = image.size[1], image.size[0]
             self.depth = len(image.getbands())
 
 
     def __len__(self) -> int:
-        return len(self.images)
+        return len(self.ad_images) + len(self.cn_images)
 
 
-    def __getitem__(self, index: int) -> torch.Tensor:
-        path = self.images[index]
+    def __getitem__(self, index: int) -> Item:
+        if index < len(self.ad_images):
+            images = self.ad_images
+            label = AD_LABEL
+        else:
+            images = self.cn_images
+            label = NC_LABEL
+            index -= len(self.ad_images)
+
+        path = images[index]
         image = decode_image(str(path))
-        return TRANSFORM(image)
-
-
-def make_dataloader(dataset: ImageListDataset, batch_size: int) -> DataLoader[torch.Tensor]:
-    num_workers = os.cpu_count() or 0
-    return DataLoader(dataset, 
-                      num_workers=num_workers, 
-                      shuffle=True,
-                      batch_size=batch_size)
+        return TRANSFORM(image), label
 
 
 class ANDIDataset:
     def __init__(self, 
                  dataset_root: Path,
-                 batch_size: int,
                  num_validation: int = 2000):
         dataset_root = dataset_root / "AD_NC"
         train_ad = dataset_root / "train" / ALZHEIMER_DISEASE
@@ -59,24 +65,18 @@ class ANDIDataset:
         test_ad_images = [*test_ad.iterdir()]
         test_cn_images = [*test_cn.iterdir()]
 
-        self.train_ad_dataset = ImageListDataset(train_ad_images[:-num_validation])
-        self.train_ad_loader = make_dataloader(self.train_ad_dataset, batch_size)
+        self.train_dataset= ImageListDataset(
+                train_ad_images[:-num_validation],
+                train_cn_images[:-num_validation])
 
-        self.validation_ad_dataset = ImageListDataset(train_ad_images[-num_validation:])
-        self.validation_ad_loader = make_dataloader(self.validation_ad_dataset, batch_size)
+        self.validation_dataset = ImageListDataset(
+                train_ad_images[-num_validation:],
+                train_cn_images[-num_validation:])
         
-        self.train_cn_dataset = ImageListDataset(train_cn_images[:-num_validation])
-        self.train_cn_loader = make_dataloader(self.train_cn_dataset, batch_size)
-
-        self.validation_cn_dataset = ImageListDataset(train_cn_images[-num_validation:])
-        self.validation_cn_loader = make_dataloader(self.validation_cn_dataset, batch_size)
-
-        self.test_ad_dataset = ImageListDataset(test_ad_images)
-        self.test_ad_loader = make_dataloader(self.test_ad_dataset, batch_size)
-
-        self.test_cn_dataset = ImageListDataset(test_cn_images)
-        self.test_cn_loader = make_dataloader(self.test_cn_dataset, batch_size)
+        self.test_dataset = ImageListDataset(
+                test_ad_images,
+                test_cn_images)
 
     @property
     def image_info(self) -> ImageInfo:
-        return ImageInfo(self.train_ad_dataset.size, self.train_ad_dataset.depth)
+        return ImageInfo(self.train_dataset.size, self.train_dataset.depth)
