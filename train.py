@@ -166,6 +166,10 @@ class ModelController(abc.ABC):
     @abc.abstractmethod
     def step(self, loss: Tensor) -> None: ...
 
+
+    @abc.abstractmethod
+    def get_lr(self) -> float: ...
+
     
     @abc.abstractmethod
     def train_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> TrainBatchStats: ...
@@ -370,10 +374,9 @@ class ModelRunner:
                     controller=params.controller
                 ), tag="Validation")
 
-                params.controller.step(eval_stats.loss)
-
                 if summary is not None:
                     summary.add_scalar("Train/loss", avg_loss, global_step=epoch)
+                    summary.add_scalar("Train/learn rate", params.controller.get_lr(), epoch)
 
                     summary.add_scalar("Validation/loss", eval_stats.loss, global_step=epoch)
                     summary.add_image("Validation/images(ground truth)", 
@@ -383,6 +386,7 @@ class ModelRunner:
                                        vutils.make_grid(eval_stats.generated_images.detach().cpu()), 
                                        global_step=epoch)
 
+                params.controller.step(eval_stats.loss)
                 epoch_end = time.time()
                 self.log(f"Epoch {epoch} done, took {epoch_end - epoch_start:2} seconds")
 
@@ -560,6 +564,10 @@ class VAEController(ModelController):
         self.scheduler.step(loss)
 
 
+    def get_lr(self) -> float:
+        return self.scheduler.get_lr()[0]
+
+
     def save_path(self) -> Path:
         return Path("vae.pth")
 
@@ -618,6 +626,10 @@ class DiffusionModelController(ModelController):
 
     def step(self, loss: Tensor) -> None:
         self.scheduler.step(loss)
+
+
+    def get_lr(self) -> float:
+        return self.scheduler.get_last_lr()[0]
 
 
     def train_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> TrainBatchStats:
