@@ -128,7 +128,6 @@ class PixelTransformer(nn.Module):
 
         if num_channels % num_heads != 0:
             raise ValueError(f"num_channels({num_channels}) must be divisable by num_heads({num_heads})")
-
         self.qkv_projection = nn.Conv2d(num_channels, num_channels * 3, kernel_size=1)
         self.num_heads = num_heads
         #self.net = nn.MultiheadAttention(num_channels, num_heads)
@@ -144,7 +143,6 @@ class PixelTransformer(nn.Module):
         #patches: torch.Tensor = self.net(q, k, v, need_weights=False)[0]
 
         return patches.view(batch, channels, height, width)
-
 
 
 class EncoderStage(nn.Module):
