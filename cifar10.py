@@ -96,7 +96,7 @@ class CIFAR10Gen(L.LightningModule):
                                       make_grid(to_rgb(images_cls), nrow=16), self.current_epoch)
 
 
-    def on_train_epoch_end(self) -> None:
+    def on_train_batch_end(self, *args, **kwargs):
         self.ema_model.update_parameters(self.model)
 
 
@@ -126,6 +126,7 @@ def main():
 
     tensorboard = loggers.TensorBoardLogger(".")
     gen = CIFAR10Gen(val_loader)
+    gen.compile()
     trainer = L.Trainer(accelerator="auto", max_epochs=500, precision="16-mixed", logger=tensorboard)
     trainer.fit(model=gen, train_dataloaders=train_loader, val_dataloaders=val_loader)
     trainer.test(model=gen, dataloaders=test_loader)
