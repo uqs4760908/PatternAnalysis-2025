@@ -14,6 +14,8 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 from torch.optim import Adam, Optimizer
 from dataclasses import dataclass
+import copy
+import functools
 import dataclasses
 import logging
 import colorlog
@@ -37,7 +39,7 @@ VAE_CONFIG = VAEConfig(
     ),
     latent_dim=4,
     num_resnet_blocks=2,
-    attention_heads=1,
+    num_attention_heads=1,
     layer_norm_num_groups=32
 )
 
@@ -138,8 +140,6 @@ class TrainerBase(abc.ABC):
         self.logger.addHandler(file_handler)
         self.logger.setLevel(logging.DEBUG)
 
-        #self.summary = SummaryWriter()
-
 
     @contextlib.contextmanager
     def setup(self, rank: int, world_size: int, file: str):
@@ -182,8 +182,36 @@ class TrainerBase(abc.ABC):
     def save_path(self) -> Path: ...
 
 
-    def batch_size(self) -> int:
-        return 4
+    @staticmethod
+    def sync(device: torch.device):
+        match device.type:
+            case "cuda":
+                torch.cuda.synchronize(device)
+            case "mps":
+                torch.mps.synchronize()
+        
+    
+    @functools.cache
+    def batch_size(self, model: nn.Module, device: torch.device) -> int:
+        image = self.dataset.train_dataset[0][0]
+
+        batch_size = 1
+
+        for size in (2, 4, 8, 16, 32, 64):
+            try:
+                # It is possible that size just fit on device, and once we/some other process allocates 
+                # some more memory allocation will fail
+                # Therefore use 'size' only if the device will have some memory left
+                data = torch.zeros((size + min(size, 4), *image.shape), device=device)
+                self.sync(device)
+                self.train_batch(model, data)
+                self.sync(device)
+                model.zero_grad(set_to_none=True)
+                batch_size = size
+            except torch.OutOfMemoryError:
+                break
+
+        return batch_size
 
 
     def optimise_model(self, device: torch.device) -> nn.Module:
@@ -212,7 +240,7 @@ class TrainerBase(abc.ABC):
             sampler = None
 
         loader = DataLoader(params.dataset, 
-                            batch_size=self.batch_size(), 
+                            batch_size=self.batch_size(params.model, params.device), 
                             shuffle=True, 
                             sampler=sampler,
                             num_workers=os.cpu_count() or 0)
@@ -228,6 +256,8 @@ class TrainerBase(abc.ABC):
 
     def train_loop(self, params: RunModelParams):
         loader, sampler = self.make_dataloader(params)
+        batch_size = self.batch_size(params.model, params.device)
+        self.logger.info(f"[{os.getpid()} {params.device}]: Using batch size {batch_size}")
 
         with self.summary_writer(params) as summary:
             for epoch in range(1, 2):
@@ -312,7 +342,7 @@ class TrainerBase(abc.ABC):
             avg_loss += stats.loss / len(loader)
 
             if generated_images.shape[0] == 0:
-                num_images = min(self.batch_size(), 8)
+                num_images = min(self.batch_size(params.model, params.device), 8)
                 generated_images = stats.generated_images[:num_images]
                 input_images = batch[:num_images]
 
