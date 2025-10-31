@@ -3,6 +3,7 @@ from torch.nn import functional as F
 from config import VAEConfig, ImageInfo, DiffusionConfig
 from enum import Enum
 from torchvision.models import inception_v3, Inception_V3_Weights
+import flash_attn
 import torch
 import typing
 import abc
@@ -125,17 +126,25 @@ class PixelTransformer(nn.Module):
     def __init__(self, num_channels: int, num_heads: int):
         super().__init__()
 
+        if num_channels % num_heads != 0:
+            raise ValueError(f"num_channels({num_channels}) must be divisable by num_heads({num_heads})")
+
         self.qkv_projection = nn.Conv2d(num_channels, num_channels * 3, kernel_size=1)
-        self.net = nn.MultiheadAttention(num_channels, num_heads)
+        self.num_heads = num_heads
+        #self.net = nn.MultiheadAttention(num_channels, num_heads)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         batch, channels, height, width = images.shape
-        images = self.qkv_projection(images)
+        images = self.qkv_projection(images) # shape: (batch, channels * 3, height, width)
+        images = images.view(batch, 3, channels // self.num_heads, self.num_heads, height * width).permute(0, 4, 1, 2, 3)
+        patches = typing.cast(torch.Tensor, flash_attn.flash_attn_qkvpacked_func(images))
+        patches = patches.view(batch, height * width, channels).transpose(1, 2)
+        #q, k, v = (t.view(batch, channels, height * width).transpose(1, 2) 
+        #           for t in images.chunk(3, 1))
+        #patches: torch.Tensor = self.net(q, k, v, need_weights=False)[0]
 
-        q, k, v = (t.view(batch, channels, height * width).transpose(1, 2) 
-                   for t in images.chunk(3, 1))
-        patches: torch.Tensor = self.net(q, k, v, need_weights=False)[0]
-        return patches.transpose(1, 2).view(batch, channels, height, width)
+        return patches.view(batch, channels, height, width)
+
 
 
 class EncoderStage(nn.Module):
