@@ -16,7 +16,6 @@ from torch.nn import functional as F
 from torch.optim import Adam, Optimizer
 from dataclasses import dataclass
 from io import StringIO
-import itertools
 import sys
 import functools
 import time
@@ -344,7 +343,7 @@ class ModelRunner:
 
                 avg_loss = torch.zeros(1, device=params.device)
 
-                for batch_idx, (batch, label) in enumerate(itertools.islice(loader, 2), start=1):
+                for batch_idx, (batch, label) in enumerate(loader, start=1):
                     batch: Tensor = batch.to(params.device)
                     one_hot_label = F.one_hot(label, NUM_CLASS).to(params.device)
 
@@ -449,7 +448,7 @@ class ModelRunner:
         assert loader.batch_size
 
 
-        for batch_idx, (batch, label) in enumerate(itertools.islice(loader, 2), start=1):
+        for batch_idx, (batch, label) in enumerate(loader, start=1):
             with torch.autocast(device_type=params.device.type):
                 batch: Tensor = batch.to(params.device)
                 one_hot_label = F.one_hot(label, NUM_CLASS).to(params.device)
