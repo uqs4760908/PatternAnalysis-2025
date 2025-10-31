@@ -11,6 +11,7 @@ A latent diffusion model that generates brain images of people with normal cogni
 - [Data preprocessing](#data-preprocessing)
 - [Training](#training)
 - [Results](#results)
+- [Diffusion process](#diffusion-process)
 - [Other attempts](#other-attempts)
 - [UMAP latent space visualisation](#umap-latent-space-visualisation)
 - [FID score](#fid-score)
