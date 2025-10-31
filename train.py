@@ -614,6 +614,7 @@ class VAEController(ModelController):
         return TrainBatchStats(loss=loss, device_stats=device_stats)
 
     
+    @torch.inference_mode()
     def eval_batch(self, model: nn.Module, batch: Tensor, label: torch.Tensor) -> EvalBatchStats:
         with torch.autocast(device_type=batch.device.type):
             generated, mu, logvar = model(batch)
