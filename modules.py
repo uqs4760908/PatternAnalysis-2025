@@ -3,6 +3,8 @@ import torch
 import typing
 import abc
 
+from torch._prims_common import device_or_default
+
 from config import VAEConfig, ImageInfo
 
 
@@ -83,7 +85,7 @@ class ResNetBlock(nn.Module):
 
         self.net = nn.Sequential(
                 ConvBlock(in_channels, out_channels, num_groups=num_groups),
-                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
                 nn.GroupNorm(num_groups, out_channels)
         )
 
@@ -223,7 +225,7 @@ class VAEEncoder(nn.Module):
 
 
 class VAEDecoder(nn.Module):
-    def __init__(self, config: VAEConfig):
+    def __init__(self, config: VAEConfig, image_info: ImageInfo):
         super().__init__()
 
         deep_num_channels = config.num_channels[-1]
@@ -243,6 +245,13 @@ class VAEDecoder(nn.Module):
             decoder_layers.append(ConvTransposeBlock(in_channels, 
                                                      out_channels, num_groups=config.layer_norm_num_groups))
             
+        decoder_layers.append(nn.Conv2d(
+            in_channels=config.num_channels[0],
+            out_channels=image_info.depth,
+            kernel_size=3,
+            padding=1
+        ))
+        decoder_layers.append(nn.Sigmoid())
         self.decoder = nn.Sequential(*decoder_layers)
 
 
@@ -268,7 +277,7 @@ class VAE(nn.Module, Autoencoder):
         self.decoder = nn.Sequential(
             FCBlock(config.latent_dim, feature_map_numel),
             nn.Unflatten(dim=1, unflattened_size=(feature_map_depth, feature_map_height, feature_map_width)),
-            VAEDecoder(config)
+            VAEDecoder(config, image_info)
         )
 
 
@@ -281,6 +290,10 @@ class VAE(nn.Module, Autoencoder):
 
     def encode(self, image: torch.Tensor) -> torch.Tensor:
         mean, logvar = self.encode_vars(image)
+        return self.sample(mean, logvar)
+
+
+    def sample(self, mean: torch.Tensor, logvar: torch.Tensor):
         if self.training:
             std = torch.exp(0.5 * logvar)
             return mean + std * torch.rand_like(mean)
@@ -293,8 +306,9 @@ class VAE(nn.Module, Autoencoder):
 
 
     def forward(self, image: torch.Tensor):
-        latent_vector = self.encode(image)
-        return self.decode(latent_vector)
+        mean, logvar = self.encode_vars(image)
+        latent_vector = self.sample(mean, logvar)
+        return self.decode(latent_vector), mean, logvar
 
 
 class DiffusionModel:
