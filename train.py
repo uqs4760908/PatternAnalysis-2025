@@ -334,7 +334,7 @@ class ModelRunner:
         self.log(f"Using batch size {batch_size}")
 
         with self.summary_writer(params) as summary:
-            for epoch in range(1, 2):
+            for epoch in range(1, params.controller.num_epochs() + 1):
                 params.model.train()
 
                 epoch_start = time.time()
