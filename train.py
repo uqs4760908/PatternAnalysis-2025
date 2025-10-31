@@ -8,6 +8,7 @@ from torch import multiprocessing as mp
 from torch import distributed as dist
 from torch import GradScaler
 from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torchvision import utils as vutils
 from tempfile import NamedTemporaryFile
 from torch import nn, Tensor
@@ -26,7 +27,7 @@ import os
 # From https://github.com/CompVis/latent-diffusion/blob/main/models/ldm/celeba256/config.yaml
 # and https://github.com/Stability-AI/stablediffusion/blob/main/configs/stable-diffusion/v2-inference-v.yaml
 VAE_CONFIG = VAEConfig(
-    learn_rate=1.0e-06,
+    learn_rate=5e-4,
     num_channels=(
         1 * 128,
         2 * 128,
@@ -40,7 +41,7 @@ VAE_CONFIG = VAEConfig(
     should_downsample_in_block=(
         (True, True),
         (True, True),
-        (False, True),
+        (True, True),
         (False, False)
     )
 )
@@ -63,7 +64,7 @@ DIFFUSION_CONFIG = DiffusionConfig(
     should_downsample_in_block=(
         (True, True),
         (True, True),
-        (False, True),
+        (True, True),
         (False, False)
     )
 )
@@ -136,6 +137,10 @@ class ModelController(abc.ABC):
 
     @abc.abstractmethod
     def num_epochs(self) -> int: ...
+
+
+    @abc.abstractmethod
+    def step(self, loss: Tensor) -> None: ...
 
     
     @abc.abstractmethod
@@ -326,6 +331,8 @@ class ModelRunner:
                     controller=params.controller
                 ), tag="Validation")
 
+                params.controller.step(eval_stats.loss)
+
                 if summary is not None:
                     summary.add_scalar("Train loss", avg_loss, global_step=epoch)
                     summary.add_scalar("Validation loss", eval_stats.loss, global_step=epoch)
@@ -493,7 +500,8 @@ class VAEController(ModelController):
         self.vae = VAE(VAE_CONFIG, dataset.image_info)
         self.optimiser = Adam(self.vae.parameters(), lr=VAE_CONFIG.learn_rate)
         self.scaler = PortableGradScaler()
- 
+        self.scheduler = ReduceLROnPlateau(self.optimiser)
+
 
     def num_epochs(self) -> int:
         return 15
@@ -505,6 +513,10 @@ class VAEController(ModelController):
         kld: Tensor = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
 
         return reconstruction + kld
+
+    
+    def step(self, loss: Tensor) -> None:
+        self.scheduler.step(loss)
 
 
     def save_path(self) -> Path:
@@ -547,6 +559,7 @@ class DiffusionModelController(ModelController):
         self.vae = vae
         self.optimiser = Adam(self.diffusion_model.parameters(), DIFFUSION_CONFIG.learn_rate)
         self.scaler = PortableGradScaler()
+        self.scheduler = ReduceLROnPlateau(self.optimiser)
 
 
     def model(self) -> nn.Module:
@@ -559,6 +572,10 @@ class DiffusionModelController(ModelController):
 
     def dependent_models(self) -> typing.Sequence[nn.Module]:
         return (self.vae,)
+
+
+    def step(self, loss: Tensor) -> None:
+        self.scheduler.step(loss)
 
 
     def train_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> RunStats:
