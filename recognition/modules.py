@@ -538,13 +538,33 @@ class DiffusionSampler(nn.Module):
 
 
     @torch.inference_mode()
-    def denoise(self, x_t: torch.Tensor, label: torch.Tensor, model: nn.Module):
+    def denoise_with_steps(self, x_t: torch.Tensor, label: torch.Tensor, model: nn.Module):
         for t in reversed(range(self.denoise_steps)):
             timestep = torch.full((x_t.size(0), ), t, device=label.device)
             eps_t = model(x_t, timestep, label)
             x_t = self.denoise_step(x_t, eps_t, t)
+            yield x_t
+        return x_t
+
+
+    @torch.inference_mode()
+    def denoise(self, x_t: torch.Tensor, label: torch.Tensor, model: nn.Module):
+        for x_t in self.denoise_with_steps(x_t, label, model):
+            pass
 
         return x_t
+
+
+    @torch.inference_mode()
+    def generate_with_steps(self, 
+                            num_images: int, 
+                            size: tuple[int, int], 
+                            latent_dim: int, 
+                            label: torch.Tensor,
+                            model: nn.Module):
+        x_t = torch.randn((num_images, latent_dim, *size), 
+                          device=label.device)
+        yield from self.denoise_with_steps(x_t, label, model)
 
 
     @torch.inference_mode()
