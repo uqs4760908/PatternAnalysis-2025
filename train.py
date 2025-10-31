@@ -495,7 +495,9 @@ class ModelRunner:
 
                 if train_status == TRAIN_STATUS_DONE:
                     self.logger.info(f"Loaded {model_name} from {controller.save_path()}")
+                    return
 
+        self.logger.info(f"Training {model_name}")
         self.run_model(self.train_loop, 
                        self.dataset.train_dataset,
                        controller)
@@ -633,8 +635,8 @@ def main():
     vae_controller = VAEController(runner)
     diffusion_controller = DiffusionModelController(vae_controller.vae)
 
-    runner.train(diffusion_controller)
     runner.train(vae_controller)
+    runner.train(diffusion_controller)
 
 
 if __name__ == "__main__":
