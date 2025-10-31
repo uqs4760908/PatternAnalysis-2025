@@ -15,9 +15,6 @@ from torch.nn import functional as F
 from torch.optim import Adam, Optimizer
 from dataclasses import dataclass
 import functools
-import dataclasses
-import logging
-import colorlog
 import time
 import typing
 import abc
@@ -104,19 +101,6 @@ class PortableGradScaler:
             optimiser.zero_grad(set_to_none=True)
 
 
-def pprint_stats(stats: typing.Any) -> list[str]:
-    lines: list[str] = []
-
-    for field in dataclasses.fields(stats):
-        value = getattr(stats, field.name)
-        if isinstance(value, Tensor) and value.numel() == 1:
-            value = value.item()
-
-        lines.append(f"{field.name}={value}")
-
-    return lines
-
-
 @dataclass(frozen=True)
 class DistributedParams:
     rank: int
@@ -190,18 +174,14 @@ class ModelRunner:
     def __init__(self):
         self.dataset = ANDIDataset(Path("./data"))
 
-        log = Path("train.log")
-        if log.exists():
-            os.truncate(log, 0)
 
-        console_handler = colorlog.StreamHandler()
-        console_handler.setFormatter(colorlog.ColoredFormatter("[%(log_color)s%(levelname)s:%(name)s%(reset)s]: %(message)s"))
-        file_handler = logging.FileHandler(log)
-        file_handler.setFormatter(logging.Formatter("[%(levelname)s:%(name)s]: %(message)s"))
-        self.logger = colorlog.getLogger(type(self).__name__)
-        self.logger.addHandler(console_handler)
-        self.logger.addHandler(file_handler)
-        self.logger.setLevel(logging.DEBUG)
+    def log(self, *args):
+        if dist.is_initialized():
+            rank = f" Rank [{dist.get_rank()}]:"
+        else:
+            rank = ""
+
+        print(f"[\033[42mINFO\033[0m]{rank}", *args)
 
 
     @contextlib.contextmanager
@@ -219,7 +199,7 @@ class ModelRunner:
         try:
             backend = dist.get_default_backend_for_device(device)
             dist.init_process_group(backend, store=store, rank=rank, world_size=world_size)
-            self.logger.info(f"Worker {os.getpid()}: rank={rank} backend={backend}")
+            self.log(f"Worker {os.getpid()} initialised: rank={rank} backend={backend}")
             yield None
         finally:
             dist.destroy_process_group()
@@ -245,8 +225,8 @@ class ModelRunner:
                 # It is possible that size just fit on device, and once we/some other process allocates 
                 # some more memory allocation will fail
                 # Therefore use 'size' only if the device will have some memory left
-                data = torch.zeros((size + min(size, 4), *image.shape), device=device)
-                label = torch.arange(0, 1, device=device).repeat((size + min(size, 4), 1))
+                data = torch.zeros((size + min(size // 2, 4), *image.shape), device=device)
+                label = torch.arange(0, 1, device=device).repeat((size + min(size // 2, 4), 1))
                 self.sync(device)
                 controller.train_batch(model, data, label)
                 self.sync(device)
@@ -260,7 +240,6 @@ class ModelRunner:
 
     def optimise_model(self, model: nn.Module, device: torch.device) -> nn.Module:
         model = model.to(device)
-        model = model.to(memory_format=torch.channels_last) # type:ignore
 
         if device.type == "cuda":
             version = torch.cuda.get_device_capability(device)
@@ -273,7 +252,7 @@ class ModelRunner:
             if version >= (7, 0) and properties.multi_processor_count >= 68:
                 model.compile()
         else:
-            model.compile()
+          model.compile()
         return model
 
 
@@ -285,13 +264,13 @@ class ModelRunner:
 
     def make_dataloader(self, params: RunModelParams):
         if params.dist_params is not None:
-            sampler=DistributedSampler(params.dataset)
+            sampler=DistributedSampler(params.dataset, shuffle=True)
         else:
             sampler = None
 
         loader = DataLoader(params.dataset, 
                             batch_size=self.batch_size(params.controller ,params.model, params.device), 
-                            shuffle=True, 
+                            shuffle=None if sampler is not None else True, 
                             sampler=sampler,
                             num_workers=os.cpu_count() or 0)
         return loader, sampler
@@ -307,10 +286,10 @@ class ModelRunner:
     def train_loop(self, params: RunModelParams):
         loader, sampler = self.make_dataloader(params)
         batch_size = self.batch_size(params.controller, params.model, params.device)
-        self.logger.info(f"[{os.getpid()} {params.device}]: Using batch size {batch_size}")
+        self.log(f"Using batch size {batch_size}")
 
         with self.summary_writer(params) as summary:
-            for epoch in range(1, 2):
+            for epoch in range(1, params.controller.num_epochs()):
                 params.model.train()
 
                 epoch_start = time.time()
@@ -318,18 +297,19 @@ class ModelRunner:
                 if sampler is not None:
                     sampler.set_epoch(epoch)
 
-                avg_loss = torch.zeros(1, device=params.device, requires_grad=False)
+                avg_loss = torch.zeros(1, device=params.device)
 
                 for batch_idx, (batch, label) in enumerate(loader, start=1):
                     batch: Tensor = batch.to(params.device)
                     one_hot_label = F.one_hot(label, NUM_CLASS).to(params.device)
 
                     stats = params.controller.train_batch(params.model, batch, one_hot_label)
-                    avg_loss += stats.loss / len(loader)
+                    with torch.no_grad():
+                        avg_loss += stats.loss / len(loader)
 
                     if (batch_idx % 50) == 0:
-                        self.logger.info(f"Training: epoch [{epoch}/{params.controller.num_epochs()}] batch [{batch_idx}/{len(loader)}]")
-                        self.logger.info(f"\tLoss : {stats.loss.item()}")
+                        self.log(f"Training: epoch [{epoch}/{params.controller.num_epochs()}] batch [{batch_idx}/{len(loader)}]")
+                        self.log(f"\tLoss : {stats.loss.item()}")
 
                 if params.is_master():
                     torch.save({
@@ -337,7 +317,7 @@ class ModelRunner:
                         MODEL_PARAMS_KEY: params.model.state_dict()
                     }, params.controller.save_path())
 
-                self.logger.info(f"Validating...")
+                self.log(f"Validating...")
                 eval_stats = self.eval_loop(RunModelParams(
                     model=params.model,
                     device=params.device,
@@ -357,13 +337,13 @@ class ModelRunner:
                                        global_step=epoch)
 
                 epoch_end = time.time()
-                self.logger.info(f"Epoch {epoch} done, took {epoch_end - epoch_start:2} seconds")
+                self.log(f"Epoch {epoch} done, took {epoch_end - epoch_start:2} seconds")
 
             torch.save({
                 TRAIN_STATUS_KEY: TRAIN_STATUS_DONE,
                 MODEL_PARAMS_KEY: params.model.state_dict()
             }, params.controller.save_path())
-            self.logger.info(f"Testing...")
+            self.log(f"Testing...")
             test_stats = self.eval_loop(RunModelParams(
                 model=params.model,
                 device=params.device,
@@ -410,13 +390,13 @@ class ModelRunner:
                 input_images = batch[:num_images]
 
             if (batch_idx % 50) == 0:
-                self.logger.info(f"{tag}: batch [{batch_idx}/{len(loader)}]")
-                self.logger.info(f"\tLoss {stats.loss.item()}")
+                self.log(f"{tag}: batch [{batch_idx}/{len(loader)}]")
+                self.log(f"\tLoss {stats.loss.item()}")
 
         end = time.time()
 
-        self.logger.info(f"{tag} done, took {end - start:2} seconds")
-        self.logger.info(f"\tAverage loss: {avg_loss.item()}")
+        self.log(f"{tag} done, took {end - start:2} seconds")
+        self.log(f"\tAverage loss: {avg_loss.item()}")
         return EvalStats(avg_loss, input_images, generated_images)
 
 
@@ -449,10 +429,10 @@ class ModelRunner:
         nprocs = torch.accelerator.device_count()
         device = get_accelerator()
 
-        self.logger.info(f"Using accelerator kind {device.type}")
+        self.log(f"Using accelerator kind {device.type}")
 
         if device.type in ("cuda", "xpu"):
-            self.logger.info(f"Found {nprocs} devices:")
+            self.log(f"Found {nprocs} devices:")
 
             for i in range(nprocs):
                 if device.type == "cuda":
@@ -460,9 +440,9 @@ class ModelRunner:
                 else:
                     name = torch.xpu.get_device_name(i)
 
-                self.logger.info(f"\t[{i + 1}]: {name}")
+                self.log(f"\t[{i + 1}]: {name}")
         else:
-            self.logger.info(f"Found {nprocs} devices")
+            self.log(f"Found {nprocs} devices")
 
         # mps does not support DistributedDataParallel
         if nprocs == 1 or device and device.type == "mps":
@@ -492,14 +472,14 @@ class ModelRunner:
                     controller.model().load_state_dict(state[MODEL_PARAMS_KEY])
 
                 if train_status == TRAIN_STATUS_DONE:
-                    self.logger.info(f"Loaded {model_name} from {controller.save_path()}")
+                    self.log(f"Loaded {model_name} from {controller.save_path()}")
                     return
 
-        self.logger.info(f"Training {model_name}")
+        self.log(f"Training {model_name}")
         self.run_model(self.train_loop, 
                        self.dataset.train_dataset,
                        controller)
-        self.logger.info(f"Train {model_name} completed")
+        self.log(f"Train {model_name} completed")
 
 
 @dataclass(frozen=True)
@@ -508,15 +488,15 @@ class VAEStats:
 
 
 class VAEController(ModelController):
-    def __init__(self, runner: ModelRunner):
+    def __init__(self, dataset: ANDIDataset):
         super().__init__()
-        self.vae = VAE(VAE_CONFIG, runner.dataset.image_info)
+        self.vae = VAE(VAE_CONFIG, dataset.image_info)
         self.optimiser = Adam(self.vae.parameters(), lr=VAE_CONFIG.learn_rate)
         self.scaler = PortableGradScaler()
  
 
     def num_epochs(self) -> int:
-        return 30
+        return 15
 
 
     @staticmethod
@@ -630,7 +610,7 @@ class DiffusionModelController(ModelController):
 
 def main():
     runner = ModelRunner()
-    vae_controller = VAEController(runner)
+    vae_controller = VAEController(runner.dataset)
     diffusion_controller = DiffusionModelController(vae_controller.vae)
 
     runner.train(vae_controller)
