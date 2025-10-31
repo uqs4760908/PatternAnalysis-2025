@@ -1,3 +1,6 @@
+"""
+A small script to visualise latent space of VAE
+"""
 from pathlib import Path
 from sklearn.preprocessing import StandardScaler
 from dataset import ANDIDataset
