@@ -16,6 +16,7 @@ from torch.nn import functional as F
 from torch.optim import Adam, Optimizer
 from dataclasses import dataclass
 from io import StringIO
+import itertools
 import sys
 import functools
 import time
@@ -240,9 +241,9 @@ class ModelRunner:
             return
 
         store = dist.FileStore(file, world_size) # type:ignore
+        backend = dist.get_default_backend_for_device(device)
+        dist.init_process_group(backend, store=store, rank=rank, world_size=world_size, device_id=rank)
         try:
-            backend = dist.get_default_backend_for_device(device)
-            dist.init_process_group(backend, store=store, rank=rank, world_size=world_size)
             self.log(f"Worker {os.getpid()} initialised: rank={rank} backend={backend}")
             yield None
         finally:
@@ -343,7 +344,7 @@ class ModelRunner:
 
                 avg_loss = torch.zeros(1, device=params.device)
 
-                for batch_idx, (batch, label) in enumerate(loader, start=1):
+                for batch_idx, (batch, label) in enumerate(itertools.islice(loader, 2), start=1):
                     batch: Tensor = batch.to(params.device)
                     one_hot_label = F.one_hot(label, NUM_CLASS).to(params.device)
 
@@ -376,6 +377,7 @@ class ModelRunner:
                         MODEL_PARAMS_KEY: params.model.state_dict()
                     }, params.controller.save_path())
 
+                dist.barrier()
                 self.log(f"Validating...")
                 eval_stats = self.eval_loop(RunModelParams(
                     model=params.model,
@@ -405,6 +407,8 @@ class ModelRunner:
                 TRAIN_STATUS_KEY: TRAIN_STATUS_DONE,
                 MODEL_PARAMS_KEY: params.model.state_dict()
             }, params.controller.save_path())
+            dist.barrier()
+
             self.log(f"Testing...")
             test_stats = self.eval_loop(RunModelParams(
                 model=params.model,
@@ -439,7 +443,7 @@ class ModelRunner:
         assert loader.batch_size
 
 
-        for batch_idx, (batch, label) in enumerate(loader, start=1):
+        for batch_idx, (batch, label) in enumerate(itertools.islice(loader, 2), start=1):
             with torch.autocast(device_type=params.device.type):
                 batch: Tensor = batch.to(params.device)
                 one_hot_label = F.one_hot(label, NUM_CLASS).to(params.device)
@@ -528,7 +532,7 @@ class ModelRunner:
         model_name = type(controller.model()).__name__
 
         if controller.save_path().exists():
-            state = torch.load(controller.save_path())
+            state = torch.load(controller.save_path(), weights_only=True, map_location="cpu")
             if isinstance(state, dict) and MODEL_PARAMS_KEY in state:
                 train_status = state.get(TRAIN_STATUS_KEY)
                 if train_status in (TRAIN_STATUS_TRAINING, TRAIN_STATUS_DONE):
