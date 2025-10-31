@@ -417,9 +417,6 @@ class ModelRunner:
                                    step=epoch)
 
                 if params.is_master() and last_loss > eval_stats.loss.item():
-                    # Note: do not use params.model here since it might be DistributedDataParallel
-                    # When loading saved model we are loading params.controller.model(),
-                    # so be consistent
                     params.controller.save_model()
                     last_loss = float(eval_stats.loss.item())
 
