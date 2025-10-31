@@ -1,4 +1,5 @@
 from torch import nn
+from torch.nn import functional as F
 from config import VAEConfig, ImageInfo, DiffusionConfig
 from enum import Enum
 import torch
@@ -127,6 +128,8 @@ class PixelTransformer(nn.Module):
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         batch, channels, height, width = images.shape
         images = self.qkv_projection(images)
+        qkv = images.view(batch, channels * 3, height * width).transpose(1, 2)
+
         q, k, v = (t.view(batch, channels, height * width).transpose(1, 2) 
                    for t in images.chunk(3, 1))
         patches: torch.Tensor = self.net(q, k, v, need_weights=False)[0]
@@ -598,6 +601,7 @@ class DiffusionModel(nn.Module):
         x_t = alpha_bar.sqrt() * batch + alpha_bar * eps
 
         prediction: torch.Tensor = self.unet(x_t, embedding)
+        prediction = F.interpolate(prediction, batch.shape[2:])
 
         return t, eps, prediction, x_t
 
