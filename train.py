@@ -3,7 +3,7 @@ from torch.utils.data.distributed import DistributedSampler
 from config import DiffusionConfig, EncoderDecoderConfig, ImageInfo, VAEConfig
 from dataset import AD_LABEL, NC_LABEL, NUM_CLASS, ANDIDataset, ImageListDataset
 from pathlib import Path
-from modules import VAE, DiffusionModel, DiffusionModelForwardMode
+from modules import VAE, DiffusionSampler, DiffusionModelForwardMode
 from torch import multiprocessing as mp
 from torch import distributed as dist
 from torch import GradScaler
@@ -70,7 +70,7 @@ DIFFUSION_CONFIG = DiffusionConfig(
         should_downsample=(
             True,
             True,
-            False,
+            True,
             False
         ),
         num_resnet_blocks=2,
@@ -674,7 +674,7 @@ class DiffusionModelController(ModelController):
     def __init__(self, vae: VAE, image_info: ImageInfo):
         super().__init__()
 
-        self.diffusion_model = DiffusionModel(
+        self.diffusion_model = DiffusionSampler(
                 DIFFUSION_CONFIG, 
                 VAE_CONFIG.latent_dim,
                 NUM_CLASS)

@@ -414,13 +414,9 @@ class DiffusionModelForwardMode(Enum):
 
 class DiffusionModel(nn.Module):
     @staticmethod
-    def beta_schedules(config: DiffusionConfig):
-        return torch.linspace(config.noise_start, config.noise_end, config.denoise_steps)
-
-
-    @staticmethod
     @torch.no_grad
-    def generate_timesteps_embeddings(timesteps: torch.Tensor, embedding_size: int):
+    def generate_timesteps_embeddings(T: int, embedding_size: int):
+        timesteps = torch.arange(0, T)
         # Positional embedding:
         # PE(pos, 2i) = sin(pos / 10000*(2i/d))
         # PE(pos, 2i + 1) = cos(pos / 10000*(2i/d))
@@ -445,17 +441,10 @@ class DiffusionModel(nn.Module):
         super().__init__()
 
         assert config.unet_config.embedding_dim
-        self.timesteps = torch.arange(0, config.denoise_steps)
-        self.timesteps_embeddings = self.generate_timesteps_embeddings(
-                self.timesteps, 
-                config.unet_config.embedding_dim)
-        self.betas = self.beta_schedules(config)
         self.unet = UNet(config, latent_channels)
-        self.denoise_steps = config.denoise_steps
-
-        self.alphas: torch.Tensor = 1 - self.betas
-        self.alpha_bars: torch.Tensor = self.alphas.cumprod(0)
-
+        self.timesteps_embedding = nn.Embedding.from_pretrained(
+                self.generate_timesteps_embeddings(config.denoise_steps, 
+                                                   config.unet_config.embedding_dim))
         self.timesteps_projection = nn.Sequential(
                 nn.Linear(config.unet_config.embedding_dim, config.unet_config.embedding_dim),
                 nn.SiLU(inplace=True),
@@ -467,53 +456,65 @@ class DiffusionModel(nn.Module):
                 nn.Linear(config.unet_config.embedding_dim, config.unet_config.embedding_dim)
         )
 
-        # Hack: IDE will not work without self.buffer = ... assignment,
-        # but torch will complain if a buffer with name already exists
-        def register(name: str, buffer: torch.Tensor):
-            delattr(self, name)
-            self.register_buffer(name, buffer)
 
-        register("timesteps", self.timesteps)
-        register("timesteps_embeddings", self.timesteps_embeddings)
-        register("betas", self.betas)
-        register("alphas", self.alphas)
-        register("alpha_bars", self.alpha_bars)
+    def embed_from_label(self, label: typing.Optional[torch.Tensor], t: torch.Tensor) -> torch.Tensor:
+        timesteps_embedding = self.timesteps_embedding(t)
+        timesteps_embedding = self.timesteps_projection(timesteps_embedding)
+
+        embedding = timesteps_embedding
+        if label is not None:
+            label_embedding = self.label_projection(label)
+            embedding = embedding + label_embedding
+        return embedding
+
+
+    def forward(self, noise: torch.Tensor, t: torch.Tensor, label: typing.Optional[torch.Tensor]):
+        embedding = self.embed_from_label(label, t)
+        return self.unet(noise, embedding)
+
+
+class DiffusionSampler(nn.Module):
+    def __init__(self, config: DiffusionConfig,):
+        super().__init__()
+
+        assert config.unet_config.embedding_dim
+        betas = torch.linspace(config.noise_start, config.noise_end, config.denoise_steps)
+        self.betas = nn.Embedding.from_pretrained(betas[:, None])
+        self.denoise_steps = config.denoise_steps
+
+        alphas = 1 - betas
+        self.alphas = nn.Embedding.from_pretrained(alphas[:, None])
+        self.alpha_bars = nn.Embedding.from_pretrained(alphas.cumprod(0)[:, None])
 
 
     @torch.inference_mode()
     def predicted_noise_to_image(self, noise: torch.Tensor, eps: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        alpha_bar_t = self.alpha_bars[t].view(noise.size(0), 1, 1, 1)
+        alpha_bar_t = self.alpha_bars(t).view(noise.size(0), 1, 1, 1)
 
         eps = (1 - alpha_bar_t).sqrt() * eps 
         return (1 / alpha_bar_t.sqrt()) * (noise - eps)
 
 
-    def embed_from_label(self, label: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        timesteps_embedding = self.timesteps_embeddings[t]
-        timesteps_embedding = self.timesteps_projection(timesteps_embedding)
-        label_embedding = self.label_projection(label)
-        embedding = timesteps_embedding + label_embedding
-        return embedding
-
-
     @torch.inference_mode()
     def denoise_step(self, x_t: torch.Tensor, eps_t: torch.Tensor, t: int) -> torch.Tensor:
-        alpha_bar_t = self.alpha_bars[t]
-        beta_t = self.betas[t]
-        alpha_bar_t_prev = self.alpha_bars[t - 1] if t != 0 else torch.zeros((1,), device=x_t.device)
+        timestep = torch.full((1,), t, device=x_t.device)
+        alpha_bar_t = self.alpha_bars(timestep)
+        beta_t = self.betas(timestep)
+        alpha_bar_t_prev = self.alpha_bars(timestep - 1) if t != 0 else torch.ones((1,), device=x_t.device)
         alpha_t = 1 - beta_t
 
         x_0 = alpha_bar_t.rsqrt() * (x_t - (1 - alpha_bar_t).sqrt() * eps_t)
         x_0 = x_0.clamp(-1, 1)
         x_0_coeff = alpha_bar_t_prev.sqrt() * beta_t / (1 - alpha_bar_t)
         x_t_coeff = alpha_t.sqrt() * (1 - alpha_bar_t_prev) / (1 - alpha_bar_t)
-
+        
         mu_t = x_0_coeff * x_0 + x_t_coeff * x_t
 
         x_t = mu_t
 
         if t > 0:
-            sigma_t = (1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * beta_t
+            #sigma_t = (1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * beta_t
+            sigma_t = beta_t
             eps_t_prev = torch.randn_like(x_t)
             x_t = mu_t + sigma_t.sqrt() * eps_t_prev
 
@@ -521,29 +522,32 @@ class DiffusionModel(nn.Module):
 
 
     @torch.inference_mode()
-    def denoise(self, x_t: torch.Tensor, label: torch.Tensor):
-        for t in reversed(range(self.timesteps.size(0))):
+    def denoise(self, x_t: torch.Tensor, label: torch.Tensor, model: nn.Module):
+        for t in reversed(range(self.denoise_steps)):
             timestep = torch.full((x_t.size(0), ), t, device=label.device)
-            embedding = self.embed_from_label(label, timestep)
-            eps_t = self.unet(x_t, embedding)
+            eps_t = model(x_t, timestep, label)
             x_t = self.denoise_step(x_t, eps_t, t)
 
         return x_t
 
 
     @torch.inference_mode()
-    def generate(self, num_images: int, size: tuple[int, int], latent_dim: int, label: torch.Tensor) -> torch.Tensor:
-        x_t = torch.normal(0, 1, 
-                             size=(num_images, latent_dim, *size), 
-                           device=label.device)
-        return self.denoise(x_t, label)
+    def generate(self, 
+                 num_images: int, 
+                 size: tuple[int, int], 
+                 latent_dim: int, 
+                 label: torch.Tensor,
+                 model: nn.Module) -> torch.Tensor:
+        x_t = torch.randn((num_images, latent_dim, *size), 
+                          device=label.device)
+        return self.denoise(x_t, label, model)
 
 
     def add_noise_step(self, x_t: torch.Tensor, t: int):
         """
         Given x_t, compute x_t+1
         """
-        beta_t = self.betas[t]
+        beta_t = self.betas(t)
         eps = torch.normal(0, 1, size=x_t.shape)
 
         x_t_next: torch.Tensor = (1 - beta_t).sqrt() * x_t + beta_t.sqrt() * eps
@@ -553,28 +557,9 @@ class DiffusionModel(nn.Module):
 
     def add_noise(self, batch: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         eps = torch.normal(0, 1, size=batch.shape, device=batch.device)
-        alpha_bar = self.alpha_bars[t].view(batch.size(0), 1, 1, 1)
+        alpha_bar = self.alpha_bars(t).view(batch.size(0), 1, 1, 1)
         x_t = alpha_bar.sqrt() * batch + (1 - alpha_bar).sqrt() * eps
         return x_t, eps
-
-
-    def reconstruct(self, batch: torch.Tensor, label: torch.Tensor, t: torch.Tensor):
-        x_t, eps = self.add_noise(batch, t)
-        embedding = self.embed_from_label(label, t)
-
-        prediction: torch.Tensor = self.unet(x_t, embedding)
-
-        return t, eps, prediction, x_t
-
-
-    def forward(self, batch: torch.Tensor, label: torch.Tensor, mode: DiffusionModelForwardMode):
-        if mode == DiffusionModelForwardMode.TRAIN:
-            t = torch.randint(0, self.denoise_steps, size=(batch.size(0),), dtype=torch.int32)
-            return self.reconstruct(batch, label, t)
-        else:
-            t = torch.full((batch.size(0),), 
-                           self.denoise_steps - 1, device=batch.device)
-            return self.reconstruct(batch, label, t)
 
 
 class FIDInception(nn.Module):
