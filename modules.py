@@ -115,7 +115,7 @@ class PixelTransformer(nn.Module):
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         batch, channels, height, width = images.shape
         images = self.qkv_projection(images) # shape: (batch, channels * 3, height, width)
-        images = images.view(batch, 3, channels // self.num_heads, self.num_heads, height * width).permute(0, 4, 1, 2, 3)
+        images = images.view(batch, 3, self.num_heads, channels // self.num_heads, height * width).permute(0, 4, 1, 2, 3)
 
         patches = typing.cast(torch.Tensor, flash_attn.flash_attn_qkvpacked_func(images))
         patches = patches.view(batch, height * width, channels).transpose(1, 2)

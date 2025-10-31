@@ -44,7 +44,7 @@ VAE_CONFIG = VAEConfig(
             False
         ),
         num_resnet_blocks=2,
-        num_attention_heads=1,
+        num_attention_heads=2,
         layer_norm_num_groups=32,
         embedding_dim=None,
         use_attention_in_up_down_sampling=False
@@ -74,7 +74,7 @@ DIFFUSION_CONFIG = DiffusionConfig(
             False
         ),
         num_resnet_blocks=2,
-        num_attention_heads=1,
+        num_attention_heads=2,
         layer_norm_num_groups=32,
         use_attention_in_up_down_sampling=True,
         embedding_dim=2
