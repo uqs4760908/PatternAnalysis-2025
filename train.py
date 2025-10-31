@@ -3,12 +3,13 @@ from torch.utils.data.distributed import DistributedSampler
 from config import DiffusionConfig, EncoderDecoderConfig, ImageInfo, VAEConfig
 from dataset import AD_LABEL, NC_LABEL, NUM_CLASS, ANDIDataset, ImageListDataset
 from pathlib import Path
-from modules import VAE, DiffusionSampler, DiffusionModelForwardMode
+from modules import VAE, DiffusionModel, DiffusionSampler
 from torch import multiprocessing as mp
 from torch import distributed as dist
 from torch import GradScaler
 from torch.utils.tensorboard import SummaryWriter
-from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.swa_utils import AveragedModel
 from torchvision import utils as vutils
 from tempfile import NamedTemporaryFile
 from torch import nn, Tensor
@@ -70,7 +71,7 @@ DIFFUSION_CONFIG = DiffusionConfig(
         should_downsample=(
             True,
             True,
-            True,
+            False,
             False
         ),
         num_resnet_blocks=2,
@@ -171,6 +172,14 @@ class ModelController(abc.ABC):
 
     def dependent_models(self) -> typing.Sequence[nn.Module]:
         return ()
+
+
+    def prepare_train(self):
+        pass
+
+
+    def prepare_eval(self):
+        pass
 
 
     @abc.abstractmethod
@@ -294,7 +303,7 @@ class ModelRunner:
                 self.sync(device)
                 controller.train_batch(model, data, label)
                 self.sync(device)
-                model.zero_grad(set_to_none=True)
+                controller.eval_batch(model, data, label)
                 batch_size = size
             except torch.OutOfMemoryError:
                 break
@@ -356,7 +365,8 @@ class ModelRunner:
             last_loss = float("inf")
 
             train_start = time.time()
-            for epoch in range(1, params.controller.num_epochs() + 1):
+            for epoch in range(1, 2):
+                params.controller.prepare_train()
                 params.model.train()
 
                 epoch_start = time.time()
@@ -418,17 +428,23 @@ class ModelRunner:
                 epoch_end = time.time()
                 self.log(f"Epoch {epoch} done, took {epoch_end - epoch_start:2} seconds")
 
-            if dist.is_available():
+            if dist.is_initialized():
                 dist.barrier()
 
             train_end = time.time()
             self.log(f"Training done, took {train_end - train_start:.2} seconds")
 
             state = torch.load(params.controller.save_path())[MODEL_PARAMS_KEY]
-            torch.save({
-                TRAIN_STATUS_KEY: TRAIN_STATUS_DONE,
-                MODEL_PARAMS_KEY: state
-            }, params.controller.save_path())
+
+            if dist.is_initialized():
+                dist.barrier()
+            
+            if params.is_master():
+                torch.save({
+                    TRAIN_STATUS_KEY: TRAIN_STATUS_DONE,
+                    MODEL_PARAMS_KEY: state
+                }, params.controller.save_path())
+
             params.controller.model().load_state_dict(state)
             self.log(f"Testing...")
             self.train_eval(
@@ -474,6 +490,7 @@ class ModelRunner:
     @torch.inference_mode()
     def eval_loop(self, params: RunModelParams, tag: str) -> EvalStats:
         params.model.eval()
+        params.controller.prepare_eval()
 
         start = time.time()
 
@@ -493,7 +510,6 @@ class ModelRunner:
             avg_loss += stats.loss / len(loader)
 
             if len(generated_images) == 0:
-                num_images = min(self.batch_size(params.controller, params.model, params.device), 16)
                 generated_images = stats.images
 
             if (batch_idx % 50) == 0:
@@ -606,7 +622,7 @@ class VAEController(ModelController):
 
 
     def num_epochs(self) -> int:
-        return 15
+        return 30
 
 
     @staticmethod
@@ -670,29 +686,44 @@ class VAEController(ModelController):
         return self.vae
 
 
+def compute_ema(avg_param: Tensor, model_param: Tensor, *_):
+    return 0.999 * avg_param + (1 - 0.999) * model_param
+
+
 class DiffusionModelController(ModelController):
     def __init__(self, vae: VAE, image_info: ImageInfo):
         super().__init__()
 
-        self.diffusion_model = DiffusionSampler(
-                DIFFUSION_CONFIG, 
-                VAE_CONFIG.latent_dim,
-                NUM_CLASS)
+        self.diffusion_model = DiffusionModel(DIFFUSION_CONFIG, 
+                                              VAE_CONFIG.latent_dim, NUM_CLASS)
+        self.ema_model = AveragedModel(self.diffusion_model, avg_fn=compute_ema)
+        self.sampler = DiffusionSampler(DIFFUSION_CONFIG)
         self.image_info = image_info
         self.vae = vae
         self.optimiser = AdamW(self.diffusion_model.parameters(), 
                               DIFFUSION_CONFIG.learn_rate, fused=True, 
                               weight_decay=DIFFUSION_CONFIG.weight_decay)
         self.scaler = PortableGradScaler()
-        self.scheduler = ReduceLROnPlateau(self.optimiser)
 
+
+    def prepare_train(self):
+        self.ema_model.train()
+        self.sampler.eval()
+        self.vae.eval()
+
+
+    def prepare_eval(self):
+        self.ema_model.eval()
+        self.sampler.eval()
+        self.vae.eval()
+        
 
     def model(self) -> nn.Module:
         return self.diffusion_model
 
 
     def num_epochs(self) -> int:
-        return 30
+        return 500
 
 
     def name(self) -> str:
@@ -700,38 +731,38 @@ class DiffusionModelController(ModelController):
 
 
     def dependent_models(self) -> typing.Sequence[nn.Module]:
-        return (self.vae,)
+        return (self.vae, self.ema_model, self.sampler)
 
 
     def step(self, loss: Tensor) -> None:
-        self.scheduler.step(loss)
+        pass
 
 
     def get_lr(self) -> float:
-        return self.scheduler.get_last_lr()[0]
+        return DIFFUSION_CONFIG.learn_rate
 
 
     def train_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> TrainBatchStats:
-        self.vae.eval()
-
         label = label.float()
         self.optimiser.zero_grad(set_to_none=True)
         with torch.autocast(device_type=batch.device.type):
             with torch.no_grad():
                 latent = self.vae.encode(batch)
 
-            t, true_eps, predict_eps, noisy_image = model(latent, 
-                                                         label, 
-                                                         DiffusionModelForwardMode.TRAIN)
-            loss = F.mse_loss(predict_eps, true_eps, reduction="sum")
+            t = torch.randint(0, DIFFUSION_CONFIG.denoise_steps, 
+                              size=(batch.size(0),), device=batch.device, dtype=torch.int32)
+            x_t, noise = self.sampler.add_noise(latent, t)
+            predict_eps = model(x_t, t, label)
+            loss = F.mse_loss(predict_eps, noise)
 
             device_stats = DeviceStats.capture(batch.device)
 
         self.scaler.scale(loss)
         self.scaler.update(self.optimiser)
+        self.ema_model.update_parameters(model)
 
-        return TrainBatchStats(loss=loss, 
-                        device_stats=device_stats)
+        return TrainBatchStats(loss=loss, device_stats=device_stats)
+
 
 
     @torch.inference_mode()
@@ -739,18 +770,13 @@ class DiffusionModelController(ModelController):
         label = label.float()
         with torch.autocast(device_type=batch.device.type):
             latent = self.vae.encode(batch)
-            t, true_eps, predict_eps, noisy_image = model(latent, 
-                                                         label, 
-                                                         DiffusionModelForwardMode.EVAL)
-            reconstruction_true = self.diffusion_model.predicted_noise_to_image(noisy_image, true_eps, t)
-            reconstruction_predict = self.diffusion_model.predicted_noise_to_image(noisy_image, predict_eps, t)
-
-
-            loss = F.mse_loss(predict_eps, true_eps, reduction="sum")
+            t = torch.full(batch.shape[:1], DIFFUSION_CONFIG.denoise_steps - 1,
+                           device=batch.device, dtype=torch.int32)
+            x_t, noise = self.sampler.add_noise(latent, t)
+            predict_eps = self.ema_model(x_t, t, label)
+            loss = F.mse_loss(predict_eps, noise)
 
             images = {
-                "Single step reconstruction(true)": self.vae.decode(reconstruction_true),
-                "Single step reconstruction(predict)": self.vae.decode(reconstruction_predict),
                 "Ground truth": batch,
             }
             return EvalBatchStats(loss=loss, 
@@ -761,27 +787,21 @@ class DiffusionModelController(ModelController):
     @torch.inference_mode()
     def generate(self, n: int, batch: Tensor, label: Tensor) -> dict[str, Tensor]:
         label = label.float()
-        self.vae.eval()
-
         with torch.autocast(device_type=batch.device.type):
-            latent = self.vae.encode(batch)
-            full_t = torch.full((batch.size(0), 1), 
-                           DIFFUSION_CONFIG.denoise_steps - 1, 
-                           device=batch.device)
-
-            x_t, noise = self.diffusion_model.add_noise(latent, full_t)
-            latent_images_predicted = self.diffusion_model.denoise(x_t, label)
-
             ad_label = F.one_hot(torch.tensor([AD_LABEL]), NUM_CLASS).to(batch.device).float()
             nc_label = F.one_hot(torch.tensor([NC_LABEL]), NUM_CLASS).to(batch.device).float()
             height: int = self.image_info.size[0] // (2 ** sum(VAE_CONFIG.encoder_decoder_config.should_downsample))
             width: int = self.image_info.size[1] // (2 ** sum(VAE_CONFIG.encoder_decoder_config.should_downsample))
             size = height, width
 
+            ad_latent = self.sampler.generate(n, size, 
+                                              VAE_CONFIG.latent_dim, ad_label, self.ema_model)
+            nc_latent = self.sampler.generate(n, size, 
+                                              VAE_CONFIG.latent_dim, nc_label, self.ema_model)
+
             return {
-                "Generate AD": self.diffusion_model.generate(n, size, VAE_CONFIG.latent_dim, ad_label),
-                "Generate CN": self.diffusion_model.generate(n, size, VAE_CONFIG.latent_dim, nc_label),
-                "Denoise from true image": self.vae.decode(latent_images_predicted)
+                "Generate AD": self.vae.decode(ad_latent),
+                "Generate CN": self.vae.decode(nc_latent)
             }
 
 
