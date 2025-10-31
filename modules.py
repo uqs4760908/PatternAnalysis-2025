@@ -191,6 +191,7 @@ class VAE(nn.Module, Autoencoder):
                     ]
         )
 
+        self.should_downsample = config.encoder_decoder_config.should_downsample
         self.feature_to_mean_logvar = nn.Conv2d(
                 in_channels=config.encoder_decoder_config.num_channels[-1],
                 out_channels=config.latent_dim * 2,
@@ -206,29 +207,33 @@ class VAE(nn.Module, Autoencoder):
 
         channels = (config.encoder_decoder_config.num_channels[0], 
                     *config.encoder_decoder_config.num_channels)
-        self.decoder = nn.Sequential(
-                *[
-                    nn.Sequential(
-                        nn.ConvTranspose2d(
-                            in_channels=channels[i + 1],
-                            out_channels=channels[i],
-                            kernel_size=3,
-                            padding=1,
-                            output_padding=1,
-                            stride=2
-                        ),
-                        ResNetBlockList(
-                            num_blocks=config.encoder_decoder_config.num_resnet_blocks,
-                            info=ResNetBlockInfo(
-                                in_channels=channels[i],
-                                out_channels=channels[i],
-                                layer_norm_num_groups=config.encoder_decoder_config.layer_norm_num_groups,
-                                embedding_dim=config.encoder_decoder_config.embedding_dim
-                            )
-                        )
+
+        decoder_layers: list[nn.Module] = []
+        for i in reversed(range(len(config.encoder_decoder_config.num_channels))):
+            resblocks = ResNetBlockList(
+                num_blocks=config.encoder_decoder_config.num_resnet_blocks,
+                info=ResNetBlockInfo(
+                    in_channels=channels[i + 1],
+                    out_channels=channels[i],
+                    layer_norm_num_groups=config.encoder_decoder_config.layer_norm_num_groups,
+                    embedding_dim=config.encoder_decoder_config.embedding_dim
+                )
+            )
+            decoder_layers.append(resblocks)
+            if config.encoder_decoder_config.should_downsample[i]:
+                upsampler = nn.ConvTranspose2d(
+                        in_channels=channels[i],
+                        out_channels=channels[i],
+                        kernel_size=3,
+                        padding=1,
+                        output_padding=1,
+                        stride=2
                     )
-                    for i in reversed(range(len(config.encoder_decoder_config.num_channels)))
-                ],
+                decoder_layers.append(upsampler)
+
+
+        self.decoder = nn.Sequential(
+                *decoder_layers,
                 nn.Conv2d(
                     in_channels=channels[0],
                     out_channels=image_info.depth,
@@ -241,8 +246,10 @@ class VAE(nn.Module, Autoencoder):
     def encode_vars(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         output = self.project_channels(image)
 
-        for layer in self.encoder:
-            _, output = layer(output)
+        for layer, downsample in zip(self.encoder, self.should_downsample):
+            output, downsampled = layer(output)
+            if downsample:
+                output = downsampled
 
         project: torch.Tensor = self.feature_to_mean_logvar(output)
         mean, logvar = project.chunk(2, dim=1)
@@ -265,7 +272,8 @@ class VAE(nn.Module, Autoencoder):
 
     def decode(self, latent_vector: torch.Tensor) -> torch.Tensor:
         feature = self.mean_logvar_to_feature(latent_vector)
-        return self.decoder(feature)
+        decoded = self.decoder(feature)
+        return decoded
 
 
     def forward(self, image: torch.Tensor):
