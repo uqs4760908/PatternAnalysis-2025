@@ -1,9 +1,9 @@
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from config import VAEConfig
-from dataset import ANDIDataset, ImageListDataset
+from config import DiffusionConfig, VAEConfig
+from dataset import AD_LABEL, ANDIDataset, ImageListDataset
 from pathlib import Path
-from modules import VAE
+from modules import VAE, DiffusionModel, DiffusionModelForwardMode
 from torch import multiprocessing as mp
 from torch import distributed as dist
 from torch import GradScaler
@@ -14,7 +14,6 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 from torch.optim import Adam, Optimizer
 from dataclasses import dataclass
-import copy
 import functools
 import dataclasses
 import logging
@@ -32,16 +31,39 @@ import os
 VAE_CONFIG = VAEConfig(
     learn_rate=1.0e-06,
     num_channels=(
-    1 * 128,
-    2 * 128,
-    4 * 128,
-    4 * 128
+        1 * 128,
+        2 * 128,
+        4 * 128,
+        4 * 128
     ),
     latent_dim=4,
     num_resnet_blocks=2,
     num_attention_heads=1,
     layer_norm_num_groups=32
 )
+
+DIFFUSION_CONFIG = DiffusionConfig(
+    learn_rate=1.0e-06,
+    num_channels=(
+        1 * 128,
+        2 * 128,
+        4 * 128,
+        4 * 128
+    ),
+    num_resnet_blocks=2,
+    num_attention_heads=1,
+    layer_norm_num_groups=32,
+
+    noise_start=0.00085,
+    noise_end=0.0120,
+    denoise_steps=1000
+)
+
+
+TRAIN_STATUS_KEY = "train_status"
+TRAIN_STATUS_TRAINING = "training"
+TRAIN_STATUS_DONE = "done"
+MODEL_PARAMS_KEY = "params"
 
 
 def get_accelerator():
@@ -91,21 +113,6 @@ class DistributedParams:
 RunModelFn = typing.Callable[[nn.Module, Tensor], typing.Any]
 
 
-@dataclass(frozen=True, slots=True)
-class RunModelParams:
-    model: nn.Module
-    device: torch.device
-    dataset: ImageListDataset
-    dist_params: typing.Optional[DistributedParams]
-
-
-    def is_master(self) -> bool:
-        return self.dist_params is None or self.dist_params.rank == 0
-
-
-RunModelLoop = typing.Callable[[RunModelParams], typing.Any]
-
-
 @dataclass(frozen=True)
 class RunStats:
     loss: Tensor
@@ -119,11 +126,51 @@ class EvalStats:
     generated_images: Tensor
 
     
-def train_batch_wrapper(trainer: "TrainerBase", model: nn.Module, batch: Tensor):
-    return trainer.train_batch(model, batch)
+class ModelController(abc.ABC):
+    """
+    Controls how a model should be executed
+    """
+    @abc.abstractmethod
+    def model(self) -> nn.Module: ...
 
 
-class TrainerBase(abc.ABC):
+    @abc.abstractmethod
+    def num_epochs(self) -> int: ...
+
+    
+    @abc.abstractmethod
+    def train_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> RunStats: ...
+
+
+    @abc.abstractmethod
+    def eval_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> RunStats: ...
+
+    
+    @abc.abstractmethod
+    def save_path(self) -> Path: ...
+
+
+@dataclass(frozen=True, slots=True)
+class RunModelParams:
+    model: nn.Module
+    device: torch.device
+    dataset: ImageListDataset
+    controller: ModelController
+    dist_params: typing.Optional[DistributedParams]
+
+
+    def is_master(self) -> bool:
+        return self.dist_params is None or self.dist_params.rank == 0
+
+
+RunModelLoop = typing.Callable[[RunModelParams], typing.Any]
+
+
+class ModelRunner:
+    """
+    Abstracts most heavy lifting for running train/eval loop such as progress reporting,
+    distributed training, snapshoting and more
+    """
     def __init__(self):
         self.dataset = ANDIDataset(Path("./data"))
 
@@ -162,26 +209,6 @@ class TrainerBase(abc.ABC):
             dist.destroy_process_group()
 
 
-    @abc.abstractmethod
-    def model(self) -> nn.Module: ...
-
-
-    @abc.abstractmethod
-    def num_epochs(self) -> int: ...
-
-    
-    @abc.abstractmethod
-    def train_batch(self, model: nn.Module, batch: Tensor) -> RunStats: ...
-
-
-    @abc.abstractmethod
-    def eval_batch(self, model: nn.Module, batch: Tensor) -> RunStats: ...
-
-    
-    @abc.abstractmethod
-    def save_path(self) -> Path: ...
-
-
     @staticmethod
     def sync(device: torch.device):
         match device.type:
@@ -192,7 +219,7 @@ class TrainerBase(abc.ABC):
         
     
     @functools.cache
-    def batch_size(self, model: nn.Module, device: torch.device) -> int:
+    def batch_size(self, controller: ModelController, model: nn.Module, device: torch.device) -> int:
         image = self.dataset.train_dataset[0][0]
 
         batch_size = 1
@@ -203,8 +230,9 @@ class TrainerBase(abc.ABC):
                 # some more memory allocation will fail
                 # Therefore use 'size' only if the device will have some memory left
                 data = torch.zeros((size + min(size, 4), *image.shape), device=device)
+                label = torch.arange(0, 1, device=device).repeat((size + min(size, 4), 1))
                 self.sync(device)
-                self.train_batch(model, data)
+                controller.train_batch(model, data, label)
                 self.sync(device)
                 model.zero_grad(set_to_none=True)
                 batch_size = size
@@ -214,9 +242,9 @@ class TrainerBase(abc.ABC):
         return batch_size
 
 
-    def optimise_model(self, device: torch.device) -> nn.Module:
-        model = self.model().to(device)
-        model: nn.Module = model.to(memory_format=torch.channels_last) # type:ignore
+    def optimise_model(self, model: nn.Module, device: torch.device) -> nn.Module:
+        model = model.to(device)
+        model = model.to(memory_format=torch.channels_last) # type:ignore
 
         if device.type == "cuda":
             version = torch.cuda.get_device_capability(device)
@@ -269,26 +297,34 @@ class TrainerBase(abc.ABC):
                     sampler.set_epoch(epoch)
 
                 avg_loss = torch.zeros(1, device=params.device, requires_grad=False)
+                zero = torch.tensor([0, 1], device=params.device).repeat((batch_size, 1))
+                ones = torch.tensor([1, 0], device=params.device).repeat((batch_size, 1))
 
-                for batch_idx, (batch, _) in enumerate(loader, start=1):
+                for batch_idx, (batch, label) in enumerate(loader, start=1):
                     batch: Tensor = batch.to(params.device)
+                    label: Tensor = label.to(params.device)
+                    label = zero if label == AD_LABEL else ones
 
-                    stats = self.train_batch(params.model, batch)
+                    stats = params.controller.train_batch(params.model, batch, label)
                     avg_loss += stats.loss / len(loader)
 
                     if (batch_idx % 50) == 0:
-                        self.logger.info(f"Training: epoch [{epoch}/{self.num_epochs()}] batch [{batch_idx}/{len(loader)}]")
+                        self.logger.info(f"Training: epoch [{epoch}/{params.controller.num_epochs()}] batch [{batch_idx}/{len(loader)}]")
                         self.logger.info(f"\tLoss : {stats.loss.item()}")
 
                 if params.is_master():
-                    torch.save(params.model.state_dict(), self.save_path())
+                    torch.save({
+                        TRAIN_STATUS_KEY: TRAIN_STATUS_TRAINING,
+                        MODEL_PARAMS_KEY: params.model.state_dict()
+                    }, params.controller.save_path())
 
                 self.logger.info(f"Validating...")
                 eval_stats = self.eval_loop(RunModelParams(
                     model=params.model,
                     device=params.device,
                     dataset=self.dataset.validation_dataset,
-                    dist_params=params.dist_params
+                    dist_params=params.dist_params,
+                    controller=params.controller
                 ), tag="Validation")
 
                 if summary is not None:
@@ -304,12 +340,17 @@ class TrainerBase(abc.ABC):
                 epoch_end = time.time()
                 self.logger.info(f"Epoch {epoch} done, took {epoch_end - epoch_start:2} seconds")
 
+            torch.save({
+                TRAIN_STATUS_KEY: TRAIN_STATUS_DONE,
+                MODEL_PARAMS_KEY: params.model.state_dict()
+            }, params.controller.save_path())
             self.logger.info(f"Testing...")
             test_stats = self.eval_loop(RunModelParams(
                 model=params.model,
                 device=params.device,
                 dataset=self.dataset.test_dataset,
-                dist_params=params.dist_params
+                dist_params=params.dist_params,
+                controller=params.controller
             ), tag="Test")
 
             if summary is not None:
@@ -334,11 +375,16 @@ class TrainerBase(abc.ABC):
         generated_images = torch.empty(0)
         avg_loss = torch.zeros(1, device=params.device, requires_grad=False)
 
-        for batch_idx, (batch, _) in enumerate(loader, start=1):
+        assert loader.batch_size
+        zero = torch.tensor([0, 1], device=params.device).repeat((loader.batch_size, 1))
+        ones = torch.tensor([1, 0], device=params.device).repeat((loader.batch_size, 1))
+
+        for batch_idx, (batch, label) in enumerate(loader, start=1):
             with torch.autocast(device_type=params.device.type):
                 batch: Tensor = batch.to(params.device)
+                label = zero if label == AD_LABEL else ones
 
-                stats = self.eval_batch(params.model, batch)
+                stats = params.controller.eval_batch(params.model, batch, label)
             avg_loss += stats.loss / len(loader)
 
             if generated_images.shape[0] == 0:
@@ -357,22 +403,32 @@ class TrainerBase(abc.ABC):
         return EvalStats(avg_loss, input_images, generated_images)
 
 
-    def run_model_worker(self, rank: int, world_size: int, file: str, fn: RunModelLoop, dataset: ImageListDataset):
+    def run_model_worker(self, 
+                         rank: int, 
+                         world_size: int, 
+                         file: str, 
+                         fn: RunModelLoop, 
+                         dataset: ImageListDataset,
+                         controller: ModelController):
         with self.setup(rank, world_size, file):
             accelerator = get_accelerator()
             device = torch.device(f"{accelerator.type}:{rank}")
-            model = self.optimise_model(device)
+            model = self.optimise_model(controller.model(), device)
             model = nn.parallel.DistributedDataParallel(model)
 
             fn(RunModelParams(
                 model=model,
                 device=device,
                 dataset=dataset,
-                dist_params=DistributedParams(rank)
+                dist_params=DistributedParams(rank),
+                controller=controller
             ))
 
 
-    def run_model(self, fn: RunModelLoop, dataset: ImageListDataset):
+    def run_model(self, 
+                  fn: RunModelLoop, 
+                  dataset: ImageListDataset,
+                  controller: ModelController):
         nprocs = torch.accelerator.device_count()
         device = get_accelerator()
 
@@ -394,23 +450,37 @@ class TrainerBase(abc.ABC):
         # mps does not support DistributedDataParallel
         if nprocs == 1 or device and device.type == "mps":
             fn(RunModelParams(
-                model=self.optimise_model(device),
+                model=self.optimise_model(controller.model(), device),
                 device=device,
                 dataset=dataset,
-                dist_params=None
+                dist_params=None,
+                controller=controller
             ))
         else:
             # delete=False since FileStore deletes the file on close
             with NamedTemporaryFile(delete=False) as file:
-                mp.spawn(self.run_model_worker, nprocs=nprocs, args=(nprocs, file.name, fn, dataset), join=True) # type:ignore
+                mp.spawn(self.run_model_worker, # type:ignore
+                         nprocs=nprocs, 
+                         args=(nprocs, file.name, fn, dataset, controller), 
+                         join=True) 
 
-    def train(self):
-        self.run_model(self.train_loop, self.dataset.train_dataset)
+    def train(self, controller: ModelController):
+        model_name = type(controller.model()).__name__
 
+        if controller.save_path().exists():
+            state = torch.load(controller.save_path())
+            if isinstance(state, dict) and MODEL_PARAMS_KEY in state:
+                train_status = state.get(TRAIN_STATUS_KEY)
+                if train_status in (TRAIN_STATUS_TRAINING, TRAIN_STATUS_DONE):
+                    controller.model().load_state_dict(state[MODEL_PARAMS_KEY])
 
-    def done(self):
-        #self.summary.close()
-        pass
+                if train_status == TRAIN_STATUS_DONE:
+                    self.logger.info(f"Loaded {model_name} from {controller.save_path()}")
+
+        self.run_model(self.train_loop, 
+                       self.dataset.train_dataset,
+                       controller)
+        self.logger.info(f"Train {model_name} completed")
 
 
 @dataclass(frozen=True)
@@ -418,13 +488,13 @@ class VAEStats:
     loss: Tensor
 
 
-class VAETrainer(TrainerBase):
-    def __init__(self):
+class VAEController(ModelController):
+    def __init__(self, runner: ModelRunner):
         super().__init__()
-        self.vae = VAE(VAE_CONFIG, self.dataset.image_info)
+        self.vae = VAE(VAE_CONFIG, runner.dataset.image_info)
         self.optimiser = Adam(self.vae.parameters(), lr=VAE_CONFIG.learn_rate)
         self.scaler = PortableGradScaler()
-
+ 
 
     def num_epochs(self) -> int:
         return 30
@@ -442,7 +512,7 @@ class VAETrainer(TrainerBase):
         return Path("vae.pth")
 
 
-    def train_batch(self, model: nn.Module, batch: Tensor) -> RunStats:
+    def train_batch(self, model: nn.Module, batch: Tensor, label: torch.Tensor) -> RunStats:
         with torch.autocast(device_type=str(batch.device)):
             generated, mu, logvar = model(batch)
 
@@ -455,7 +525,7 @@ class VAETrainer(TrainerBase):
         return RunStats(loss=loss, generated_images=generated)
 
     
-    def eval_batch(self, model: nn.Module, batch: Tensor) -> RunStats:
+    def eval_batch(self, model: nn.Module, batch: Tensor, label: torch.Tensor) -> RunStats:
         with torch.autocast(device_type=str(batch.device)):
             generated, mu, logvar = model(batch)
 
@@ -467,7 +537,79 @@ class VAETrainer(TrainerBase):
         return self.vae
 
 
+class DiffusionModelController(ModelController):
+    def __init__(self, vae: VAE):
+        super().__init__()
+
+        self.diffusion = DiffusionModel(
+                DIFFUSION_CONFIG, 
+                VAE_CONFIG.latent_dim, 
+                num_classes=2)
+        self.vae = vae
+        self.optimiser = Adam(self.diffusion.parameters(), DIFFUSION_CONFIG.learn_rate)
+        self.scaler = PortableGradScaler()
+
+
+    def model(self) -> nn.Module:
+        return self.diffusion
+
+
+    def num_epochs(self) -> int:
+        return 30
+
+
+    def train_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> RunStats:
+        with torch.autocast(device_type=batch.device.type):
+            latent = self.vae.encode(batch)
+            t, true_eps, predict_eps, noisy_image = model(latent, 
+                                                         label, 
+                                                         DiffusionModelForwardMode.TRAIN)
+            loss = F.mse_loss(predict_eps, true_eps)
+
+        self.optimiser.zero_grad(set_to_none=True)
+        self.scaler.scale(loss)
+        self.scaler.update(self.optimiser)
+
+
+        latent_images = self.diffusion.predicted_noise_to_image(
+            noisy_image, 
+            predict_eps, 
+            t)
+        images = self.vae.decode(latent_images)
+        return RunStats(loss=loss, 
+                        generated_images=images)
+
+
+    @torch.inference_mode()
+    def eval_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> RunStats:
+        with torch.autocast(device_type=batch.device.type):
+            latent = self.vae.encode(batch)
+            t, true_eps, predict_eps, noisy_image = model(latent, 
+                                                         label, 
+                                                         DiffusionModelForwardMode.EVAL)
+
+            latent_images = self.diffusion.predicted_noise_to_image(
+                noisy_image, 
+                predict_eps, 
+                t)
+            images = self.vae.decode(latent_images)
+            loss = F.mse_loss(batch, images)
+            return RunStats(loss=loss, 
+                            generated_images=images)
+
+
+    def save_path(self) -> Path:
+        return Path("diffusion.pth")
+
+
+def main():
+    runner = ModelRunner()
+    vae_controller = VAEController(runner)
+    diffusion_controller = DiffusionModelController(vae_controller.vae)
+
+    runner.train(diffusion_controller)
+    runner.train(vae_controller)
+
+
 if __name__ == "__main__":
-    trainer = VAETrainer()
-    trainer.train()
-    trainer.done()
+    main()
