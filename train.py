@@ -676,7 +676,6 @@ class DiffusionModelController(ModelController):
 
         device_stats = DeviceStats.capture(batch.device)
 
-        self.optimiser.zero_grad(set_to_none=True)
         self.scaler.scale(loss)
         self.scaler.update(self.optimiser)
 
