@@ -1,9 +1,11 @@
+import math
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from config import DiffusionConfig, EncoderDecoderConfig, ImageInfo, VAEConfig
 from dataset import AD_LABEL, NC_LABEL, NUM_CLASS, ANDIDataset, ImageListDataset
 from pathlib import Path
 from modules import VAE, DiffusionModel, DiffusionSampler
+from torchvision.transforms.v2 import functional as VF
 from torch import multiprocessing as mp
 from torch import distributed as dist
 from torch import GradScaler
@@ -15,6 +17,7 @@ from tempfile import NamedTemporaryFile
 from torch import nn, Tensor
 from torch.nn import functional as F
 from torch.optim import AdamW, Optimizer
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from dataclasses import dataclass
 from io import StringIO
 import sys
@@ -448,6 +451,7 @@ class ModelRunner:
             )
 
 
+    @torch.inference_mode()
     def train_eval(self, 
                   train_params: RunModelParams, 
                   summary: typing.Optional[SummaryWriter], 
@@ -609,22 +613,31 @@ class VAEController(ModelController):
                               weight_decay=VAE_CONFIG.weight_decay)
         self.scaler = PortableGradScaler()
         self.scheduler = CosineAnnealingLR(self.optimiser, self.num_epochs())
+        self.loss_vgg = LearnedPerceptualImagePatchSimilarity("vgg", normalize=True)
+        self.lpips_mse_anneal = 0
 
 
     def num_epochs(self) -> int:
         return 30
 
 
-    @staticmethod
-    def loss_fn(image: Tensor, generated: Tensor, mu: Tensor, logvar: Tensor) -> Tensor:
-        reconstruction: Tensor = F.mse_loss(image, generated, reduction="none").sum(dim=[1, 2, 3]).mean()
-        kld: Tensor = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=[1, 2, 3]).mean()
+    def dependent_models(self) -> typing.Sequence[nn.Module]:
+        return (self.loss_vgg,)
 
-        return reconstruction + 1e-6 * kld
+
+    def loss_fn(self, image: Tensor, generated: Tensor, mu: Tensor, logvar: Tensor) -> Tensor:
+        weight = math.exp(2 * (self.lpips_mse_anneal / self.num_epochs() - 2))
+        image = VF.grayscale_to_rgb(image)
+        generated = VF.grayscale_to_rgb(generated)
+        reconstruction = weight * self.loss_vgg(image, generated) + (1 - weight) * F.mse_loss(generated, image)
+        kld: Tensor = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=(1, 2, 3)).mean()
+
+        return reconstruction + 1e-4 * kld
 
     
     def step(self, loss: Tensor) -> None:
         self.scheduler.step()
+        self.lpips_mse_anneal += 1
 
 
     def name(self) -> str:
@@ -658,7 +671,7 @@ class VAEController(ModelController):
 
             loss = self.loss_fn(batch, generated, mu, logvar)
             images = {
-                    "Ground truth": batch,
+                    "Ground ruth": batch,
                     "Generated": generated
             }
             return EvalBatchStats(loss=loss, images=images, device_stats=DeviceStats.capture(batch.device))

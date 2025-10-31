@@ -1,5 +1,5 @@
 from torch.utils.data import Dataset
-from torchvision.transforms.v2 import ToDtype, Compose, RandomHorizontalFlip, Transform
+from torchvision.transforms import v2
 from torchvision.io.image import decode_image
 from pathlib import Path
 from PIL import Image
@@ -10,11 +10,13 @@ from config import ImageInfo
 
 ALZHEIMER_DISEASE = "AD"
 COGNITIVE_NORMAL = "NC"
-TRAIN_TRANSFORM = Compose([
-    ToDtype(dtype=torch.float32, scale=True),
-    RandomHorizontalFlip()
+TRAIN_TRANSFORM = v2.Compose([
+    v2.ToDtype(dtype=torch.float32, scale=True),
+    v2.RandomHorizontalFlip(),
 ])
-TEST_TRANSFORM = ToDtype(dtype=torch.float32, scale=True)
+TEST_TRANSFORM = v2.Compose([
+    v2.ToDtype(dtype=torch.float32, scale=True),
+])
 
 
 AD_LABEL = 0
@@ -27,7 +29,7 @@ class ImageListDataset(Dataset[Item]):
     def __init__(self, 
                  ad_images: list[Path],
                  cn_images: list[Path],
-                 transform: Transform):
+                 transform: v2.Transform):
         super().__init__()
         self.ad_images = ad_images
         self.cn_images = cn_images
