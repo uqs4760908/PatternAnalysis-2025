@@ -1,9 +1,9 @@
 from torch import nn
+from config import VAEConfig, ImageInfo, DiffusionConfig
+from enum import Enum
 import torch
 import typing
 import abc
-
-from config import VAEConfig, ImageInfo, DiffusionConfig
 
 
 class FCBlock(nn.Module):
@@ -477,16 +477,25 @@ class UNet(nn.Module):
         return output
 
 
+class DiffusionModelForwardMode(Enum):
+    """
+    Since we might wrap DiffusionModel in DistributedDataParallel,
+    the only entry point to DiffusionModel is forward(aka __call__)
+    During training, forward() samples a random t, where in inference
+    we want to run it over all steps
+    """
+    TRAIN = 0
+    EVAL = 1
+
+
 class DiffusionModel(nn.Module):
     @staticmethod
-    @torch.no_grad
     def beta_schedules(config: DiffusionConfig):
-        timesteps = torch.arange(0, config.denoise_steps)
-        factor = (config.noise_start - config.noise_end) / config.denoise_steps
-        return timesteps, config.noise_start - factor * timesteps
+        return torch.linspace(config.noise_start, config.noise_end, config.denoise_steps)
 
 
     @staticmethod
+    @torch.no_grad
     def generate_timesteps_embeddings(timesteps: torch.Tensor, embedding_size: int):
         out = torch.empty_like(timesteps)
 
@@ -505,8 +514,9 @@ class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig, latent_channels: int, num_classes: int):
         super().__init__()
 
-        self.timesteps, self.betas = self.beta_schedules(config)
+        self.timesteps = torch.arange(0, config.denoise_steps)
         self.timesteps_embeddings = self.generate_timesteps_embeddings(self.timesteps, num_classes)
+        self.betas = self.beta_schedules(config)
         self.unet = UNet(config, latent_channels, num_classes)
         self.denoise_steps = config.denoise_steps
 
@@ -520,15 +530,49 @@ class DiffusionModel(nn.Module):
         self.register_buffer("alpha_bars", self.alpha_bars)
 
 
-    def forward(self, batch: torch.Tensor, label: torch.Tensor):
-        t = int(torch.randint(0, self.denoise_steps, size=(batch.size(0),)).int().item())
-        eps = torch.normal(0, 1, size=batch.shape[1:], device=batch.device)
+    @torch.inference_mode()
+    def predicted_noise_to_image(self, noise: torch.Tensor, eps: torch.Tensor, t: int) -> torch.Tensor:
+        beta_t = self.betas[t]
+        alpha_t = 1 - beta_t
+        alpha_bar_t = self.alpha_bars[t]
+
+        x_0 = (beta_t / (1 - alpha_bar_t).sqrt()) * eps
+        return (1 / alpha_t.sqrt()) * (noise - x_0)
+
+
+    def embed_from_label(self, label: torch.Tensor, t: int) -> torch.Tensor:
         timesteps_embedding = self.timesteps_embeddings[t]
         embedding = timesteps_embedding + label
+        return embedding
+
+
+    def generate(self, image_info: ImageInfo, label: torch.Tensor) -> torch.Tensor:
+        noise = torch.normal(0, 1, 
+                             size=(image_info.depth, *image_info.size), device=self.timesteps.device)
+
+        for t in reversed(range(self.timesteps.size(0))):
+            embedding = self.embed_from_label(label, t)
+            prediction = self.unet(noise, embedding)
+            noise = self.predicted_noise_to_image(noise, prediction, t)
+
+        return noise
+
+
+    def reconstruct(self, batch: torch.Tensor, label: torch.Tensor, t: int):
+        eps = torch.normal(0, 1, size=batch.shape[1:], device=batch.device)
+        embedding = self.embed_from_label(label, t)
 
         alpha_bar = self.alpha_bars[t]
         x_t = alpha_bar.sqrt() * batch + alpha_bar * eps
 
-        prediction = self.unet(x_t, embedding)
+        prediction: torch.Tensor = self.unet(x_t, embedding)
 
-        return eps, prediction
+        return t, eps, prediction, x_t
+
+
+    def forward(self, batch: torch.Tensor, label: torch.Tensor, mode: DiffusionModelForwardMode):
+        if mode == DiffusionModelForwardMode.TRAIN:
+            t = int(torch.randint(0, self.denoise_steps, size=(batch.size(0),)).int().item())
+            return self.reconstruct(batch, label, t)
+        else:
+            return self.reconstruct(batch, label, self.timesteps.size(0))
