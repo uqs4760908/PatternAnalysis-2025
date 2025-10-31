@@ -135,7 +135,7 @@ class PixelTransformer(nn.Module):
         q, k, v = (t.view(batch, channels, height * width).transpose(1, 2) 
                    for t in images.chunk(3, 1))
         patches: torch.Tensor = self.net(q, k, v, need_weights=False)[0]
-        return patches.view(batch, channels, height, width)
+        return patches.transpose(1, 2).view(batch, channels, height, width)
 
 
 class EncoderStage(nn.Module):
