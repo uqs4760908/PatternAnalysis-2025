@@ -11,6 +11,7 @@ class VAEConfig:
     num_attention_heads: int
     layer_norm_num_groups: int
     should_downsample_in_block: typing.Sequence[tuple[bool, bool]]
+    weight_decay: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,3 +31,4 @@ class DiffusionConfig:
     num_attention_heads: int
     layer_norm_num_groups: int
     should_downsample_in_block: typing.Sequence[tuple[bool, bool]]
+    weight_decay: float

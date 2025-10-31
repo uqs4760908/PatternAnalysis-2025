@@ -13,7 +13,7 @@ from torchvision import utils as vutils
 from tempfile import NamedTemporaryFile
 from torch import nn, Tensor
 from torch.nn import functional as F
-from torch.optim import Adam, Optimizer
+from torch.optim import AdamW, Optimizer
 from dataclasses import dataclass
 from io import StringIO
 import sys
@@ -45,7 +45,8 @@ VAE_CONFIG = VAEConfig(
         (True, True),
         (True, True),
         (False, False)
-    )
+    ),
+    weight_decay=1e-6
 )
 
 DIFFUSION_CONFIG = DiffusionConfig(
@@ -68,7 +69,8 @@ DIFFUSION_CONFIG = DiffusionConfig(
         (True, True),
         (True, True),
         (False, False)
-    )
+    ),
+    weight_decay=1e-6
 )
 
 
@@ -561,7 +563,9 @@ class VAEController(ModelController):
     def __init__(self, dataset: ANDIDataset):
         super().__init__()
         self.vae = VAE(VAE_CONFIG, dataset.image_info)
-        self.optimiser = Adam(self.vae.parameters(), lr=VAE_CONFIG.learn_rate)
+        self.optimiser = AdamW(self.vae.parameters(), 
+                              lr=VAE_CONFIG.learn_rate, fused=True, 
+                              weight_decay=VAE_CONFIG.weight_decay)
         self.scaler = PortableGradScaler()
         self.scheduler = ReduceLROnPlateau(self.optimiser)
 
@@ -625,7 +629,9 @@ class DiffusionModelController(ModelController):
                 VAE_CONFIG.latent_dim, 
                 num_classes=2)
         self.vae = vae
-        self.optimiser = Adam(self.diffusion_model.parameters(), DIFFUSION_CONFIG.learn_rate)
+        self.optimiser = AdamW(self.diffusion_model.parameters(), 
+                              DIFFUSION_CONFIG.learn_rate, fused=True, 
+                              weight_decay=DIFFUSION_CONFIG.weight_decay)
         self.scaler = PortableGradScaler()
         self.scheduler = ReduceLROnPlateau(self.optimiser)
 
