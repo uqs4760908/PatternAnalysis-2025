@@ -630,7 +630,7 @@ class DiffusionModel(nn.Module):
         embedding = self.embed_from_label(label, t)
 
         alpha_bar = self.alpha_bars[t].view(t.size(0), 1, 1, 1)
-        x_t = alpha_bar.sqrt() * batch + alpha_bar * eps
+        x_t = alpha_bar.sqrt() * batch + (1 - alpha_bar).sqrt() * eps
 
         prediction: torch.Tensor = self.unet(x_t, embedding)
         prediction = F.interpolate(prediction, batch.shape[2:])
