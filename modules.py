@@ -429,7 +429,7 @@ class DiffusionModel(nn.Module):
         out = torch.empty((timesteps.size(0), embedding_size), device=timesteps.device)
         # The bitand -2 rounds odd elements down to the closest even
         # This extracts 'i'(in the formula above) from 0..N
-        denom = torch.exp(-math.log(timesteps.size(0)) * 2 * (torch.arange(0, embedding_size) & -2) / embedding_size)
+        denom = torch.exp(-math.log(10000) * 2 * (torch.arange(0, embedding_size) & -2) / embedding_size)
         numerator = timesteps.reshape(timesteps.size(0), 1)
         angles = numerator * denom
 
@@ -498,17 +498,20 @@ class DiffusionModel(nn.Module):
 
     @torch.inference_mode()
     def denoise_step(self, x_t: torch.Tensor, eps_t: torch.Tensor, t: int) -> torch.Tensor:
-        alpha_bar_t_prev = torch.ones((1,), device=eps_t.device) if t == 0 else self.alpha_bars[t - 1]
         alpha_bar_t = self.alpha_bars[t]
         beta_t = self.betas[t]
         alpha_t = 1 - beta_t
 
         coeff_x_t = beta_t * (1 - alpha_bar_t).rsqrt()
         mu_t = alpha_t.rsqrt() * (x_t - coeff_x_t * eps_t)
-        sigma_t = (1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * beta_t
 
-        eps_t_prev = torch.normal(0, 1, size=x_t.shape, device=x_t.device)
-        x_t = mu_t + sigma_t.sqrt() * eps_t_prev
+        x_t = mu_t
+
+        if t > 0:
+            alpha_bar_t_prev = self.alpha_bars[t - 1]
+            sigma_t = (1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * beta_t
+            eps_t_prev = torch.normal(0, 1, size=x_t.shape, device=x_t.device)
+            x_t = x_t + sigma_t.sqrt() * eps_t_prev
 
         return x_t
 
