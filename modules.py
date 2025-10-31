@@ -511,6 +511,10 @@ class DiffusionSampler(nn.Module):
         x_t_coeff = alphas.sqrt() * beta_bars
         self.x_t_coeff = nn.Embedding.from_pretrained(x_t_coeff.unsqueeze(1))
 
+        # Coefficients for loss function
+        loss_scales = beta_bars.square() / (2 * beta_bars * alphas * (1 - alpha_bars))
+        self.loss_scales = nn.Embedding.from_pretrained(loss_scales)
+
 
     @torch.inference_mode()
     def predicted_noise_to_image(self, noise: torch.Tensor, eps: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
