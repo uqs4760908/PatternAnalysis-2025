@@ -225,8 +225,8 @@ class ModelRunner:
             clear = ""
 
         io = StringIO()
-        print(f"[{color}INFO{clear}]{rank}", *args, file=io, end="")
-        print(io.getvalue())
+        print(f"[{color}INFO{clear}]{rank}", *args, file=io)
+        print(io.getvalue(), end="")
 
 
     @contextlib.contextmanager
