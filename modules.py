@@ -488,12 +488,28 @@ class DiffusionSampler(nn.Module):
 
         assert config.unet_config.embedding_dim
         betas = torch.linspace(config.noise_start, config.noise_end, config.denoise_steps)
-        self.betas = nn.Embedding.from_pretrained(betas[:, None])
+        self.betas = nn.Embedding.from_pretrained(betas.unsqueeze(1))
         self.denoise_steps = config.denoise_steps
 
         alphas = 1 - betas
-        self.alphas = nn.Embedding.from_pretrained(alphas[:, None])
-        self.alpha_bars = nn.Embedding.from_pretrained(alphas.cumprod(0)[:, None])
+        self.alphas = nn.Embedding.from_pretrained(alphas.unsqueeze(1))
+        alpha_bars = alphas.cumprod(0)
+        self.alpha_bars = nn.Embedding.from_pretrained(alpha_bars.unsqueeze(1))
+
+        # Coefficients for x_0 = 1/sqrt(alpha_bar_t) * (x_t - sqrt(1 - alpha_bar_t) * eps)
+        alpha_bars_sqrt_recp = alpha_bars.rsqrt()
+        self.alpha_bars_sqrt_recp = nn.Embedding.from_pretrained(alpha_bars_sqrt_recp.unsqueeze(1))
+        one_minus_alpha_bar_sqrt = (1 - alpha_bars).sqrt()
+        self.one_minus_alpha_bar_sqrt = nn.Embedding.from_pretrained(one_minus_alpha_bar_sqrt.unsqueeze(1))
+
+        # Coefficients for equation 7
+        alpha_t_minus_one = torch.cat([torch.ones(1), alpha_bars])[:alpha_bars.size(0)]
+        beta_bars = (betas * (1 - alpha_t_minus_one) / (1 - alpha_bars))
+        self.beta_bars = nn.Embedding.from_pretrained(beta_bars.unsqueeze(1))
+        x_0_coeff = alpha_t_minus_one.sqrt() * betas / (1 - alpha_bars)
+        self.x_0_coeff = nn.Embedding.from_pretrained(x_0_coeff.unsqueeze(1))
+        x_t_coeff = alphas.sqrt() * beta_bars
+        self.x_t_coeff = nn.Embedding.from_pretrained(x_t_coeff.unsqueeze(1))
 
 
     @torch.inference_mode()
@@ -507,23 +523,15 @@ class DiffusionSampler(nn.Module):
     @torch.inference_mode()
     def denoise_step(self, x_t: torch.Tensor, eps_t: torch.Tensor, t: int) -> torch.Tensor:
         timestep = torch.full((1,), t, device=x_t.device)
-        alpha_bar_t = self.alpha_bars(timestep)
-        beta_t = self.betas(timestep)
-        alpha_bar_t_prev = self.alpha_bars(timestep - 1) if t != 0 else torch.ones((1,), device=x_t.device)
-        alpha_t = 1 - beta_t
 
-        x_0 = alpha_bar_t.rsqrt() * (x_t - (1 - alpha_bar_t).sqrt() * eps_t)
-        #x_0 = x_0.clamp(-1, 1)
-        x_0_coeff = alpha_bar_t_prev.sqrt() * beta_t / (1 - alpha_bar_t)
-        x_t_coeff = alpha_t.sqrt() * (1 - alpha_bar_t_prev) / (1 - alpha_bar_t)
+        x_0 = self.alpha_bars_sqrt_recp(timestep) * (x_t - self.one_minus_alpha_bar_sqrt(timestep) * eps_t)
         
-        mu_t = x_0_coeff * x_0 + x_t_coeff * x_t
+        mu_t = self.x_0_coeff(timestep) * x_0 + self.x_t_coeff(timestep) * x_t
 
         x_t = mu_t
 
         if t > 0:
-            #sigma_t = (1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * beta_t
-            sigma_t = beta_t
+            sigma_t = self.beta_bars(timestep)
             eps_t_prev = torch.randn_like(x_t)
             x_t = mu_t + sigma_t.sqrt() * eps_t_prev
 
