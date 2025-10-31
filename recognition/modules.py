@@ -8,12 +8,10 @@ import math
 from torch import nn
 from torch.nn import functional as F
 from config import EncoderDecoderConfig, VAEConfig, ImageInfo, DiffusionConfig
-from enum import Enum
 from dataclasses import dataclass
 import dataclasses
 import torch
 import typing
-import abc
 
 
 class SequentialWithEmbedding(nn.ModuleList):
@@ -64,7 +62,7 @@ class PixelTransformer(nn.Module):
 
         q, k, v = (t.view(batch, channels, height * width).transpose(1, 2) 
                    for t in qkv.chunk(3, 1))
-        patches: torch.Tensor = self.net(q, k, v, need_weights=False)[0]
+        patches: torch.Tensor = self.net(q, k, v, need_weights=False)[0] #(batch, height*width, channels)
         patches = patches.transpose(1, 2).view(batch, channels, height, width)
         patches = self.project_out(patches)
         return images + patches
@@ -177,6 +175,9 @@ class EncoderStage(nn.Module):
 
 
     def conv(self, batch: torch.Tensor, embedding: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Feed batch through ResNetBlockList
+        """
         output = self.resnet_list(batch, embedding)
         return output
 
@@ -285,6 +286,9 @@ class VAE(nn.Module):
     
 
     def encode(self, image: torch.Tensor) -> torch.Tensor:
+        """
+        Encodes image into a latent vector
+        """
         mean, logvar = self.encode_vars(image)
         return self.sample(mean, logvar)
 
@@ -298,6 +302,9 @@ class VAE(nn.Module):
 
 
     def decode(self, latent_vector: torch.Tensor) -> torch.Tensor:
+        """
+        Decode latent_vector into an image
+        """
         feature = self.mean_logvar_to_feature(latent_vector)
         decoded = self.decoder(feature)
         return decoded
@@ -496,6 +503,8 @@ class DiffusionSampler(nn.Module):
     """
     Implements equation 4 and 7 in the DDPM paper to handles noise addition/removal
     This module contains no learnable parameter.
+
+    Some methods takes a model parameter. This should be a DiffusionModel(or a wrapper around it)
     """
     def __init__(self, config: DiffusionConfig):
         super().__init__()
@@ -526,14 +535,6 @@ class DiffusionSampler(nn.Module):
 
 
     @torch.inference_mode()
-    def predicted_noise_to_image(self, noise: torch.Tensor, eps: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        alpha_bar_t = self.alpha_bars(t).view(noise.size(0), 1, 1, 1)
-
-        eps = (1 - alpha_bar_t).sqrt() * eps 
-        return (1 / alpha_bar_t.sqrt()) * (noise - eps)
-
-
-    @torch.inference_mode()
     def denoise_step(self, x_t: torch.Tensor, eps_t: torch.Tensor, t: int) -> torch.Tensor:
         timestep = torch.full((1,), t, device=x_t.device)
 
@@ -553,6 +554,9 @@ class DiffusionSampler(nn.Module):
 
     @torch.inference_mode()
     def denoise_with_steps(self, x_t: torch.Tensor, label: torch.Tensor, model: nn.Module):
+        """
+        Given x_t, compute x_0 while returning all intermediate x_t-1, x_t-2...
+        """
         for t in reversed(range(self.denoise_steps)):
             timestep = torch.full((x_t.size(0), ), t, device=label.device)
             eps_t = model(x_t, timestep, label)
@@ -563,6 +567,9 @@ class DiffusionSampler(nn.Module):
 
     @torch.inference_mode()
     def denoise(self, x_t: torch.Tensor, label: torch.Tensor, model: nn.Module):
+        """
+        Given x_t, compute x_0
+        """
         for x_t in self.denoise_with_steps(x_t, label, model):
             pass
 
@@ -576,6 +583,9 @@ class DiffusionSampler(nn.Module):
                             latent_dim: int, 
                             label: torch.Tensor,
                             model: nn.Module):
+        """
+        Generate an image while returning all intermediate noisy images
+        """
         x_t = torch.randn((num_images, latent_dim, *size), 
                           device=label.device)
         yield from self.denoise_with_steps(x_t, label, model)
@@ -606,6 +616,9 @@ class DiffusionSampler(nn.Module):
 
 
     def add_noise(self, batch: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Given x_0, compute x_t
+        """
         eps = torch.normal(0, 1, size=batch.shape, device=batch.device)
         alpha_bar = self.alpha_bars(t).view(batch.size(0), 1, 1, 1)
         x_t = alpha_bar.sqrt() * batch + (1 - alpha_bar).sqrt() * eps
