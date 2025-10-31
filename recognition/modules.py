@@ -3,7 +3,6 @@ from torch import nn
 from torch.nn import functional as F
 from config import EncoderDecoderConfig, VAEConfig, ImageInfo, DiffusionConfig
 from enum import Enum
-from torchvision.models import inception_v3, Inception_V3_Weights
 from dataclasses import dataclass
 import dataclasses
 import torch
@@ -596,28 +595,3 @@ class DiffusionSampler(nn.Module):
         alpha_bar = self.alpha_bars(t).view(batch.size(0), 1, 1, 1)
         x_t = alpha_bar.sqrt() * batch + (1 - alpha_bar).sqrt() * eps
         return x_t, eps
-
-
-class FIDInception(nn.Module):
-    FEATURE_MAP_SIZE = 2048
-
-    def __init__(self):
-        super().__init__()
-        self.inception = inception_v3(Inception_V3_Weights.DEFAULT)
-        self.inception.fc = nn.Identity() # type:ignore
-
-
-    @staticmethod
-    def fid_score(mu1: torch.Tensor, mu2: torch.Tensor, sigma1: torch.Tensor, sigma2: torch.Tensor):
-        mu_dist = F.mse_loss(mu1, mu2, reduction="sum")
-        sigma12 = sigma1.mm(sigma2)
-        eigvec, eigval = torch.linalg.eig(sigma12)
-        eigval = eigval.sqrt()
-        sigma12_sqrt = eigvec.mm(eigval).mm(eigvec.T)
-
-        sigma_trace = torch.trace(sigma1 + sigma2 - 2 * sigma12_sqrt)
-        return mu_dist + sigma_trace
-
-
-    def forward(self, batch: torch.Tensor) -> torch.Tensor:
-        return self.inception(batch)
