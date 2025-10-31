@@ -1,49 +1,14 @@
 from torch import nn
 from torch.nn import functional as F
-from config import VAEConfig, ImageInfo, DiffusionConfig
+from config import EncoderDecoderConfig, VAEConfig, ImageInfo, DiffusionConfig
 from enum import Enum
 from torchvision.models import inception_v3, Inception_V3_Weights
+from dataclasses import dataclass
 import flash_attn
+import dataclasses
 import torch
 import typing
 import abc
-
-
-class FCBlock(nn.Module):
-    def __init__(self, in_features: int, out_features: int):
-        super().__init__()
-
-        self.net = nn.Sequential(
-                nn.Linear(in_features, out_features),
-                nn.SiLU(inplace=True)
-        )
-
-
-    def forward(self, batch: torch.Tensor) -> torch.Tensor:
-        return self.net(batch)
-
-
-class ConvBlock(nn.Module):
-    def __init__(self, 
-                 in_channels: int, 
-                 out_channels: int, 
-                 kernel_size: int = 3, 
-                 num_groups=32,
-                 padding: typing.Optional[int] = None):
-        super().__init__()
-
-        if padding is None:
-            padding = (kernel_size - 1) // 2
-
-        self.net = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, 
-                          kernel_size, padding=padding, bias=False),
-                nn.GroupNorm(num_groups, out_channels),
-                nn.SiLU(inplace=True)
-        )
-
-    def forward(self, batch: torch.Tensor) -> torch.Tensor:
-        return self.net(batch)
 
 
 class SequentialWithEmbedding(nn.ModuleList):
@@ -57,35 +22,58 @@ class SequentialWithEmbedding(nn.ModuleList):
         return batch
 
 
+@dataclass(frozen=True)
+class ResNetBlockInfo:
+    in_channels: int
+    out_channels: int
+    layer_norm_num_groups: int
+    embedding_dim: typing.Optional[int]
+
+
 class ResNetBlock(nn.Module):
-    def __init__(self, 
-                 in_channels: int, 
-                 out_channels: int,
-                 num_groups: int,
-                 embedding_dim: typing.Optional[int]):
+    def __init__(self, info: ResNetBlockInfo):
         super().__init__()
 
-        self.input_net = ConvBlock(in_channels, out_channels, num_groups=num_groups)
+        self.input_net = nn.Sequential(
+                nn.Conv2d(
+                        in_channels=info.in_channels, 
+                        out_channels=info.out_channels, 
+                        kernel_size=3, 
+                        padding=1, 
+                        bias=False),
+                nn.GroupNorm(
+                    num_groups=info.layer_norm_num_groups, 
+                    num_channels=info.out_channels),
+                nn.SiLU(inplace=True)
+        )
         self.output_net = nn.Sequential(
-                nn.Conv2d(out_channels, out_channels, kernel_size=3, 
-                          padding=1, bias=False),
-                nn.GroupNorm(num_groups, out_channels)
+                nn.Conv2d(
+                    in_channels=info.out_channels, 
+                    out_channels=info.out_channels, 
+                    kernel_size=3, 
+                    padding=1, 
+                    bias=False),
+                nn.GroupNorm(
+                    num_groups=info.layer_norm_num_groups, 
+                    num_channels=info.out_channels)
         )
 
-        if embedding_dim is not None:
-            if embedding_dim != out_channels:
+        if info.embedding_dim is not None:
+            if info.embedding_dim != info.out_channels:
                 self.embedding_projection_net = nn.Linear(
-                        embedding_dim,
-                        out_channels
+                    info.embedding_dim,
+                    info.out_channels
                 )
             else:
                 self.embedding_projection_net = nn.Identity()
         else:
             self.embedding_projection_net = None
 
-        if in_channels != out_channels:
-            self.skip_connection: nn.Module = nn.Conv2d(in_channels, out_channels, 
-                                                        kernel_size=3, padding=1)
+        if info.in_channels != info.out_channels:
+            self.skip_connection: nn.Module = nn.Conv2d(
+                    in_channels=info.in_channels, 
+                    out_channels=info.out_channels, 
+                    kernel_size=1)
         else:
             self.skip_connection: nn.Module = nn.Identity()
 
@@ -106,19 +94,11 @@ class ResNetBlock(nn.Module):
 
 
 class ResNetBlockList(SequentialWithEmbedding):
-    def __init__(self, 
-                 num_blocks: int, 
-                 in_channels: int, 
-                 out_channels: int, 
-                 num_groups: int,
-                 embedding_dim: typing.Optional[int]):
+    def __init__(self, num_blocks: int, info: ResNetBlockInfo):
+        inner_info = dataclasses.replace(info, in_channels=info.out_channels)
         super().__init__(
-            ResNetBlock(in_channels, out_channels, 
-                        num_groups, embedding_dim),
-            *(ResNetBlock(out_channels, 
-                          out_channels, 
-                          num_groups,
-                          embedding_dim) for _ in range(num_blocks - 1))
+            ResNetBlock(info),
+            *(ResNetBlock(inner_info) for _ in range(num_blocks - 1))
         )
 
 
@@ -136,6 +116,7 @@ class PixelTransformer(nn.Module):
         batch, channels, height, width = images.shape
         images = self.qkv_projection(images) # shape: (batch, channels * 3, height, width)
         images = images.view(batch, 3, channels // self.num_heads, self.num_heads, height * width).permute(0, 4, 1, 2, 3)
+
         patches = typing.cast(torch.Tensor, flash_attn.flash_attn_qkvpacked_func(images))
         patches = patches.view(batch, height * width, channels).transpose(1, 2)
         #q, k, v = (t.view(batch, channels, height * width).transpose(1, 2) 
@@ -146,91 +127,44 @@ class PixelTransformer(nn.Module):
 
 
 class EncoderStage(nn.Module):
-    def __init__(self, 
-                 in_channels: int, 
-                 out_channels: int, 
-                 num_resnet_blocks: int,
-                 num_groups: int,
-                 num_heads: int,
-                 use_attention: bool,
-                 embedding_dim: typing.Optional[int],
-                 should_downsample: tuple[bool, bool]):
+    def __init__(self, stage_index: int, config: EncoderDecoderConfig):
         super().__init__()
 
+        channels = (config.num_channels[0], *config.num_channels)
+        info = ResNetBlockInfo(
+            in_channels=channels[stage_index],
+            out_channels=channels[stage_index + 1],
+            layer_norm_num_groups=config.layer_norm_num_groups,
+            embedding_dim=config.embedding_dim
+        )
         self.resnet_list = ResNetBlockList(
-                    num_resnet_blocks,
-                    in_channels,
-                    out_channels,
-                    num_groups,
-                    embedding_dim)
+        config.num_resnet_blocks,
+            info
+        )
 
-        if use_attention:
-            self.transformer = PixelTransformer(out_channels, num_heads)
+        if config.use_attention_in_up_down_sampling:
+            self.transformer = PixelTransformer(
+                    info.out_channels, 
+                    config.num_attention_heads)
         else:
             self.transformer = nn.Identity()
 
-        self.avgpool = nn.AvgPool2d(kernel_size=(should_downsample[0] + 1, should_downsample[1] + 1))
 
-
-    def forward(self, batch: torch.Tensor, embedding: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
-        output: torch.Tensor = self.resnet_list(batch, embedding)
+    def conv(self, batch: torch.Tensor, embedding: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
+        output = self.resnet_list(batch, embedding)
         output = self.transformer(output)
-        output = self.avgpool(output)
         return output
 
 
-class DecoderStage(nn.Module):
-    def __init__(self, 
-                 in_channels: int,
-                 out_channels: int,
-                 num_resnet_blocks: int,
-                 num_groups: int,
-                 num_heads: int,
-                 use_attention: int,
-                 embedding_dim: typing.Optional[int],
-                 should_upsample: tuple[bool, bool],
-                 upsample_with_activation: bool = True):
-        super().__init__()
-
-        self.resnet_list = ResNetBlockList(num_resnet_blocks, 
-                            in_channels, 
-                            out_channels,
-                            num_groups,
-                            embedding_dim)
-
-        if use_attention:
-            self.transformer = PixelTransformer(out_channels, num_heads)
-        else:
-            self.transformer = nn.Identity()
-
-        upsample_layers: list[nn.Module] = [
-            nn.ConvTranspose2d(
-                out_channels,
-                out_channels,
-                kernel_size=3,
-                stride=(should_upsample[0] + 1, should_upsample[1] + 1),
-                padding=1,
-                output_padding=(int(should_upsample[0]), int(should_upsample[1])),
-                bias=False
-            ),
-        ]
-
-        # ugly hack for VAE, since its last layer does not need normalisation and activation
-        if upsample_with_activation:
-            upsample_layers.extend([
-                nn.GroupNorm(num_groups, out_channels),
-                nn.SiLU(inplace=True)
-            ])
+    def downsample(self, batch: torch.Tensor) -> torch.Tensor:
+        return F.avg_pool2d(batch, kernel_size=2)
 
 
-        self.upsampler = nn.Sequential(*upsample_layers)
-
-
-    def forward(self, batch: torch.Tensor, embedding: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
-        output: torch.Tensor = self.resnet_list(batch, embedding)
-        output = self.transformer(output)
-        output = self.upsampler(output)
-        return output
+    def forward(self, batch: torch.Tensor, 
+                embedding: typing.Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
+        output = self.conv(batch, embedding)
+        downsampled = self.downsample(output)
+        return output, downsampled
 
 
 class Autoencoder(abc.ABC):
@@ -241,224 +175,76 @@ class Autoencoder(abc.ABC):
     def decode(self, latent_vector: torch.Tensor) -> torch.Tensor: ...
 
 
-class DownsamplePass(nn.Module):
-    def __init__(self, 
-                 in_channels: int, 
-                 num_channels: typing.Sequence[int],
-                 num_resnet_blocks: int,
-                 layer_norm_num_groups: int,
-                 num_attention_heads: int,
-                 use_attention_in_block: typing.Sequence[bool],
-                 embedding_dim: typing.Optional[int],
-                 should_downsample_in_block: typing.Sequence[tuple[bool, bool]]):
-        super().__init__()
-
-        if in_channels != num_channels[0]:
-            self.project_channels = nn.Conv2d(
-                    in_channels,
-                    num_channels[0],
-                    kernel_size=1,
-                    padding=1)
-        else:
-            self.project_channels = nn.Identity()
-
-        layers: list[nn.Module] = []
-
-        out_channels_list = (*num_channels[1:], num_channels[-1])
-        for in_channels, out_channels, should_downsample, use_attention in zip(
-                                                                                num_channels, 
-                                                                                out_channels_list, 
-                                                                                should_downsample_in_block, 
-                                                                                use_attention_in_block):
-            layers.append(EncoderStage(in_channels, 
-                                       out_channels, 
-                                       num_resnet_blocks, 
-                                       layer_norm_num_groups,
-                                       num_attention_heads, 
-                                       use_attention,
-                                       embedding_dim,
-                                       should_downsample))
-
-        self.net = SequentialWithEmbedding(*layers)
-
-
-    def forward(self, batch: torch.Tensor, embedding: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
-        output = self.project_channels(batch)
-        output = self.net(output, embedding)
-        return output
-
-
-class AutoEncoder(nn.Sequential):
-    def __init__(self, 
-                 in_channels: int, 
-                 num_channels: typing.Sequence[int],
-                 num_resnet_blocks: int,
-                 layer_norm_num_groups: int,
-                 num_attention_heads: int,
-                 should_downsample_in_block: typing.Sequence[tuple[bool, bool]]):
-        deep_num_channels = num_channels[-1]
-
-        layers = (
-            DownsamplePass(in_channels, 
-                           num_channels, 
-                           num_resnet_blocks,
-                           layer_norm_num_groups,
-                           num_attention_heads,
-                           (False,) * len(num_channels),
-                           None,
-                           should_downsample_in_block),
-            ResNetBlock(deep_num_channels, deep_num_channels, 
-                        layer_norm_num_groups, None),
-            PixelTransformer(deep_num_channels, num_attention_heads),
-            ResNetBlock(deep_num_channels, deep_num_channels, 
-                        num_resnet_blocks, None)
-        )
-        super().__init__(*layers)
-
-
-class UpsamplePass(nn.Module):
-    def __init__(self, 
-                 out_channels: int, 
-                 num_channels: typing.Sequence[int],
-                 num_resnet_blocks: int,
-                 layer_norm_num_groups: int,
-                 num_attention_heads: int,
-                 use_attention_for_block: typing.Sequence[bool],
-                 embedding_dim: typing.Optional[int],
-                 should_upsample_in_block: typing.Sequence[tuple[bool, bool]]):
-        super().__init__()
-
-        layers: list[nn.Module] = []
-
-        in_channels_list = (*num_channels[1:], num_channels[-1])
-
-        if out_channels != num_channels[0]:
-            self.project_channels = nn.Conv2d(
-                    num_channels[0],
-                    out_channels,
-                    kernel_size=1,
-                    padding=1
-            )
-        else:
-            self.project_channels = nn.Identity()
-
-        for in_channels, out_channels, use_attention, should_upsample in reversed((*zip(
-                                                                                in_channels_list, 
-                                                                                num_channels, 
-                                                                                use_attention_for_block, 
-                                                                                should_upsample_in_block),)):
-            layers.append(DecoderStage(in_channels, 
-                                       out_channels, 
-                                       num_resnet_blocks,
-                                       layer_norm_num_groups,
-                                       num_attention_heads,
-                                       use_attention,
-                                       embedding_dim,
-                                       should_upsample))
-
-
-        self.net = SequentialWithEmbedding(*layers)
-
-
-    def forward(self, batch: torch.Tensor, embedding: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
-        output = self.net(batch, embedding)
-        output = self.project_channels(output)
-        return output
-
-
-class AutoDecoder(nn.Module):
-    def __init__(self, 
-                 out_channels: int, 
-                 num_channels: typing.Sequence[int],
-                 num_resnet_blocks: int,
-                 layer_norm_num_groups: int,
-                 num_attention_heads: int,
-                 should_upsample_in_block: typing.Sequence[tuple[bool, bool]]):
-        super().__init__()
-
-        deep_num_channels = num_channels[-1]
-
-        # VAE's last upsampling layer should not have normalisation and SiLU activation
-        # Construct UpsamplePass for n-1 passes and construct DecoderStage manually to disable 
-        # normalisation and SiLU
-        self.decoder = nn.Sequential(
-                ResNetBlock(deep_num_channels, deep_num_channels, 
-                            layer_norm_num_groups, None),
-                PixelTransformer(deep_num_channels, num_attention_heads),
-                ResNetBlock(deep_num_channels, deep_num_channels, 
-                            num_resnet_blocks, None),
-                UpsamplePass(num_channels[1],
-                             num_channels[1:],
-                             num_resnet_blocks,
-                             layer_norm_num_groups,
-                             num_attention_heads,
-                             (False,) * (len(num_channels) - 1),
-                             None,
-                             should_upsample_in_block[1:]),
-                DecoderStage(
-                    num_channels[1],
-                    num_channels[0],
-                    num_resnet_blocks,
-                    layer_norm_num_groups,
-                    num_attention_heads,
-                    False,
-                    None,
-                    should_upsample_in_block[0],
-                    False
-                ),
-                nn.Conv2d(
-                    num_channels[0],
-                    out_channels,
-                    kernel_size=1,
-                ),
-                nn.Sigmoid()
-        )
-
-
-    def forward(self, latent_vector: torch.Tensor) -> torch.Tensor:
-        return self.decoder(latent_vector)
-
-
 class VAE(nn.Module, Autoencoder):
-    def __init__(self, 
-                 config: VAEConfig,
-                 image_info: ImageInfo):
+    def __init__(self, config: VAEConfig, image_info: ImageInfo):
         super().__init__()
         
-        self.encoder = AutoEncoder(
-                image_info.depth,
-                config.num_channels,
-                config.num_resnet_blocks,
-                config.layer_norm_num_groups,
-                num_attention_heads=config.num_attention_heads,
-                should_downsample_in_block=config.should_downsample_in_block
+        self.project_channels = nn.Conv2d(
+                        in_channels=image_info.depth,
+                        out_channels=config.encoder_decoder_config.num_channels[0],
+                        kernel_size=1
+                    )
+        self.encoder = nn.ModuleList(
+            [
+                        EncoderStage(i, config.encoder_decoder_config)
+                            for i in range(len(config.encoder_decoder_config.num_channels))
+                    ]
         )
+
         self.feature_to_mean_logvar = nn.Conv2d(
-                in_channels=config.num_channels[-1],
+                in_channels=config.encoder_decoder_config.num_channels[-1],
                 out_channels=config.latent_dim * 2,
                 kernel_size=3,
                 padding=1
         )
         self.mean_logvar_to_feature = nn.Conv2d(
                 in_channels=config.latent_dim,
-                out_channels=config.num_channels[-1],
+                out_channels=config.encoder_decoder_config.num_channels[-1],
                 kernel_size=3,
                 padding=1
         )
 
-        self.decoder = AutoDecoder(
-                image_info.depth,
-                config.num_channels,
-                config.num_resnet_blocks,
-                config.layer_norm_num_groups,
-                config.num_attention_heads,
-                config.should_downsample_in_block
+        channels = (config.encoder_decoder_config.num_channels[0], 
+                    *config.encoder_decoder_config.num_channels)
+        self.decoder = nn.Sequential(
+                *[
+                    nn.Sequential(
+                        nn.ConvTranspose2d(
+                            in_channels=channels[i + 1],
+                            out_channels=channels[i],
+                            kernel_size=3,
+                            padding=1,
+                            output_padding=1,
+                            stride=2
+                        ),
+                        ResNetBlockList(
+                            num_blocks=config.encoder_decoder_config.num_resnet_blocks,
+                            info=ResNetBlockInfo(
+                                in_channels=channels[i],
+                                out_channels=channels[i],
+                                layer_norm_num_groups=config.encoder_decoder_config.layer_norm_num_groups,
+                                embedding_dim=config.encoder_decoder_config.embedding_dim
+                            )
+                        )
+                    )
+                    for i in reversed(range(len(config.encoder_decoder_config.num_channels)))
+                ],
+                nn.Conv2d(
+                    in_channels=channels[0],
+                    out_channels=image_info.depth,
+                    kernel_size=1
+                ),
+            nn.Sigmoid()
         )
 
 
     def encode_vars(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        feature_maps = self.encoder(image)
-        project: torch.Tensor = self.feature_to_mean_logvar(feature_maps)
+        output = self.project_channels(image)
+
+        for layer in self.encoder:
+            _, output = layer(output)
+
+        project: torch.Tensor = self.feature_to_mean_logvar(output)
         mean, logvar = project.chunk(2, dim=1)
 
         return mean, logvar
@@ -488,59 +274,109 @@ class VAE(nn.Module, Autoencoder):
         return self.decode(latent_vector), mean, logvar
 
 
+class UNetUpsampler(nn.Module):
+    def __init__(self, stage: int, config: EncoderDecoderConfig):
+        super().__init__()
+
+        channels = (config.num_channels[0], *config.num_channels)
+
+        if config.should_downsample[stage]:
+            self.upsampler = nn.ConvTranspose2d(
+                    in_channels=channels[stage + 1],
+                    out_channels=channels[stage],
+                    kernel_size=3,
+                    padding=1,
+                    output_padding=1,
+                    stride=2
+            )
+        else:
+            self.upsampler = nn.Conv2d(
+                in_channels=channels[stage + 1],
+                out_channels=channels[stage],
+                kernel_size=1,
+            )
+
+        self.conv = ResNetBlockList(
+                num_blocks=config.num_resnet_blocks,
+                info=ResNetBlockInfo(
+                    in_channels=channels[stage] + channels[stage + 1],
+                    out_channels=channels[stage],
+                    layer_norm_num_groups=config.layer_norm_num_groups,
+                    embedding_dim=config.embedding_dim
+                )
+        )
+
+
 class UNet(nn.Module):
     def __init__(self, 
                  config: DiffusionConfig, 
-                 latent_channels: int,
-                 num_classes: int):
+                 latent_channels: int):
         super().__init__()
 
-        self.downsample = DownsamplePass(
-                latent_channels,
-                config.num_channels,
-                config.num_resnet_blocks,
-                config.layer_norm_num_groups,
-                config.num_attention_heads,
-                (True,) * len(config.num_channels),
-                num_classes,
-                should_downsample_in_block=config.should_downsample_in_block
+        self.downsample_projection = nn.Conv2d(
+            in_channels=latent_channels,
+            out_channels=config.unet_config.num_channels[0],
+            kernel_size=1,
         )
+        self.downsample_passes = nn.ModuleList([
+            EncoderStage(i, config.unet_config) 
+                for i in range(len(config.unet_config.num_channels))
+        ])
+        self.should_downsample = config.unet_config.should_downsample
 
-        self.mid_resnet1 = ResNetBlock(
-            config.num_channels[-1],
-            config.num_channels[-1],
-            num_groups=config.layer_norm_num_groups,
-            embedding_dim=num_classes
+        info = ResNetBlockInfo(
+            in_channels=config.unet_config.num_channels[-1],
+            out_channels=config.unet_config.num_channels[-1],
+            layer_norm_num_groups=config.unet_config.layer_norm_num_groups,
+            embedding_dim=config.unet_config.embedding_dim
         )
+        self.mid_resnet1 = ResNetBlock(info)
         self.mid_pixel_transformer = PixelTransformer(
-            config.num_channels[-1],
-            num_heads=config.num_attention_heads
+            num_channels=info.out_channels,
+            num_heads=config.unet_config.num_attention_heads
         )
-        self.mid_resnet2 = ResNetBlock(
-            config.num_channels[-1],
-            config.num_channels[-1],
-            num_groups=config.layer_norm_num_groups,
-            embedding_dim=num_classes
-        )
+        self.mid_resnet2 = ResNetBlock(info)
 
-        self.upsample = UpsamplePass(
-                latent_channels,
-                config.num_channels,
-                config.num_resnet_blocks,
-                config.layer_norm_num_groups,
-                config.num_attention_heads,
-                (True,) * len(config.num_channels),
-                num_classes,
-                config.should_downsample_in_block
+        self.upsample_passes = nn.ModuleList([
+            UNetUpsampler(i, config=config.unet_config)
+                for i in reversed(range(len(config.unet_config.num_channels) - 1))
+        ])
+        self.upsample_projection = nn.Conv2d(
+                in_channels=config.unet_config.num_channels[0],
+                out_channels=latent_channels,
+                kernel_size=1
         )
 
 
     def forward(self, batch: torch.Tensor, embedding: torch.Tensor) -> torch.Tensor:
-        output: torch.Tensor = self.downsample(batch, embedding)
+        downsample_outputs: list[torch.Tensor] = []
+
+        output: torch.Tensor = self.downsample_projection(batch)
+        for module, downsample in zip(self.downsample_passes, self.should_downsample):
+            module = typing.cast(EncoderStage, module)
+            output = module.conv(output, embedding)
+            downsample_outputs.append(output)
+
+            if downsample:
+                output = module.downsample(output)
+
         output = self.mid_resnet1(output, embedding)
         output = self.mid_pixel_transformer(output)
         output = self.mid_resnet2(output, embedding)
-        output = self.upsample(output, embedding)
+
+        for module, downsample_output in zip(
+                self.upsample_passes, 
+                reversed(downsample_outputs[:-1])):
+            module = typing.cast(UNetUpsampler, module)
+            output = module.upsampler(output)
+
+            if output.shape[2:] != downsample_output.shape[2:]:
+                output = F.interpolate(output, size=downsample_output.shape[2:])
+
+            output = torch.cat([output, downsample_output], dim=1)
+            output = module.conv(output, embedding)
+
+        output = self.upsample_projection(output)
         return output
 
 
@@ -578,13 +414,16 @@ class DiffusionModel(nn.Module):
         return out
 
 
-    def __init__(self, config: DiffusionConfig, latent_channels: int, num_classes: int):
+    def __init__(self, config: DiffusionConfig, latent_channels: int):
         super().__init__()
 
+        assert config.unet_config.embedding_dim
         self.timesteps = torch.arange(0, config.denoise_steps)
-        self.timesteps_embeddings = self.generate_timesteps_embeddings(self.timesteps, num_classes)
+        self.timesteps_embeddings = self.generate_timesteps_embeddings(
+                self.timesteps, 
+                config.unet_config.embedding_dim)
         self.betas = self.beta_schedules(config)
-        self.unet = UNet(config, latent_channels, num_classes)
+        self.unet = UNet(config, latent_channels)
         self.denoise_steps = config.denoise_steps
 
         self.alphas: torch.Tensor = 1 - self.betas
@@ -605,12 +444,10 @@ class DiffusionModel(nn.Module):
 
     @torch.inference_mode()
     def predicted_noise_to_image(self, noise: torch.Tensor, eps: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        beta_t = self.betas[t].view(noise.size(0), 1, 1, 1)
-        alpha_t = 1 - beta_t
         alpha_bar_t = self.alpha_bars[t].view(noise.size(0), 1, 1, 1)
 
-        x_0 = (beta_t / (1 - alpha_bar_t).sqrt()) * eps
-        return (1 / alpha_t.sqrt()) * (noise - x_0)
+        eps = (1 - alpha_bar_t).sqrt() * eps 
+        return (1 / alpha_bar_t.sqrt()) * (noise - eps)
 
 
     def embed_from_label(self, label: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -633,15 +470,18 @@ class DiffusionModel(nn.Module):
         return noise
 
 
-    def reconstruct(self, batch: torch.Tensor, label: torch.Tensor, t: torch.Tensor):
+    def add_noise(self, batch: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         eps = torch.normal(0, 1, size=batch.shape, device=batch.device)
-        embedding = self.embed_from_label(label, t)
-
         alpha_bar = self.alpha_bars[t].view(t.size(0), 1, 1, 1)
         x_t = alpha_bar.sqrt() * batch + (1 - alpha_bar).sqrt() * eps
+        return x_t, eps
+
+
+    def reconstruct(self, batch: torch.Tensor, label: torch.Tensor, t: torch.Tensor):
+        x_t, eps = self.add_noise(batch, t)
+        embedding = self.embed_from_label(label, t)
 
         prediction: torch.Tensor = self.unet(x_t, embedding)
-        prediction = F.interpolate(prediction, batch.shape[2:])
 
         return t, eps, prediction, x_t
 

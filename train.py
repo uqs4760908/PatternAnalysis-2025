@@ -1,6 +1,6 @@
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from config import DiffusionConfig, VAEConfig
+from config import DiffusionConfig, EncoderDecoderConfig, VAEConfig
 from dataset import NUM_CLASS, ANDIDataset, ImageListDataset
 from pathlib import Path
 from modules import VAE, DiffusionModel, DiffusionModelForwardMode
@@ -30,47 +30,55 @@ import os
 # and https://github.com/Stability-AI/stablediffusion/blob/main/configs/stable-diffusion/v2-inference-v.yaml
 VAE_CONFIG = VAEConfig(
     learn_rate=1e-4,
-    num_channels=(
-        1 * 128,
-        2 * 128,
-        4 * 128,
-        4 * 128
+    encoder_decoder_config=EncoderDecoderConfig(
+        num_channels=(
+            1 * 128,
+            2 * 128,
+            4 * 128,
+            4 * 128
+        ),
+        should_downsample=(
+            True,
+            True,
+            True,
+            False
+        ),
+        num_resnet_blocks=2,
+        num_attention_heads=1,
+        layer_norm_num_groups=32,
+        embedding_dim=None,
+        use_attention_in_up_down_sampling=False
     ),
     latent_dim=4,
-    num_resnet_blocks=2,
-    num_attention_heads=1,
-    layer_norm_num_groups=32,
-    should_downsample_in_block=(
-        (True, True),
-        (True, True),
-        (True, True),
-        (False, False)
-    ),
-    weight_decay=1e-6
+    weight_decay=1e-6,
 )
 
 DIFFUSION_CONFIG = DiffusionConfig(
     learn_rate=1.0e-06,
-    num_channels=(
-        1 * 128,
-        2 * 128,
-        4 * 128,
-        4 * 128
-    ),
-    num_resnet_blocks=2,
-    num_attention_heads=1,
-    layer_norm_num_groups=32,
 
     noise_start=0.00085,
     noise_end=0.0120,
     denoise_steps=1000,
-    should_downsample_in_block=(
-        (True, True),
-        (True, True),
-        (True, True),
-        (False, False)
-    ),
-    weight_decay=1e-6
+    weight_decay=1e-6,
+    unet_config=EncoderDecoderConfig(
+        num_channels=(
+            1 * 128,
+            2 * 128,
+            4 * 128,
+            4 * 128
+        ),
+        should_downsample=(
+            True,
+            True,
+            False,
+            False
+        ),
+        num_resnet_blocks=2,
+        num_attention_heads=1,
+        layer_norm_num_groups=32,
+        use_attention_in_up_down_sampling=True,
+        embedding_dim=2
+    )
 )
 
 
@@ -106,7 +114,7 @@ class PortableGradScaler:
             optimiser.zero_grad(set_to_none=True)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class DistributedParams:
     rank: int
 
@@ -114,7 +122,7 @@ class DistributedParams:
 RunModelFn = typing.Callable[[nn.Module, Tensor], typing.Any]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class DeviceStats:
     temperature: int
     usage: int
@@ -131,20 +139,20 @@ class DeviceStats:
         return None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class TrainBatchStats:
     loss: Tensor
     device_stats: typing.Optional[DeviceStats]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class EvalBatchStats:
     loss: Tensor
     generated_images: Tensor
     device_stats: typing.Optional[DeviceStats]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class EvalStats:
     loss: Tensor
     input_images: Tensor
@@ -191,7 +199,7 @@ class ModelController(abc.ABC):
     def save_path(self) -> Path: ...
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class RunModelParams:
     model: nn.Module
     device: torch.device
@@ -404,6 +412,8 @@ class ModelRunner:
                 epoch_end = time.time()
                 self.log(f"Epoch {epoch} done, took {epoch_end - epoch_start:2} seconds")
 
+            state = torch.load(params.controller.save_path())[MODEL_PARAMS_KEY]
+            params.controller.model().load_state_dict(state)
             self.log(f"Testing...")
             self.train_eval(
                 train_params=params,
@@ -641,8 +651,7 @@ class DiffusionModelController(ModelController):
 
         self.diffusion_model = DiffusionModel(
                 DIFFUSION_CONFIG, 
-                VAE_CONFIG.latent_dim, 
-                num_classes=2)
+                VAE_CONFIG.latent_dim)
         self.vae = vae
         self.optimiser = AdamW(self.diffusion_model.parameters(), 
                               DIFFUSION_CONFIG.learn_rate, fused=True, 
@@ -684,8 +693,6 @@ class DiffusionModelController(ModelController):
             t, true_eps, predict_eps, noisy_image = model(latent, 
                                                          label, 
                                                          DiffusionModelForwardMode.TRAIN)
-            print(true_eps)
-            print(predict_eps)
             loss = F.mse_loss(predict_eps, true_eps)
 
         device_stats = DeviceStats.capture(batch.device)
