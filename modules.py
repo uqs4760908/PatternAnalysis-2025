@@ -4,11 +4,16 @@ from config import EncoderDecoderConfig, VAEConfig, ImageInfo, DiffusionConfig
 from enum import Enum
 from torchvision.models import inception_v3, Inception_V3_Weights
 from dataclasses import dataclass
-import flash_attn
 import dataclasses
 import torch
 import typing
 import abc
+
+
+try:
+    import flash_attn
+except ImportError:
+    flash_attn = None
 
 
 class SequentialWithEmbedding(nn.ModuleList):
@@ -110,20 +115,26 @@ class PixelTransformer(nn.Module):
             raise ValueError(f"num_channels({num_channels}) must be divisable by num_heads({num_heads})")
         self.qkv_projection = nn.Conv2d(num_channels, num_channels * 3, kernel_size=1)
         self.num_heads = num_heads
-        #self.net = nn.MultiheadAttention(num_channels, num_heads)
+
+        if flash_attn is None:
+            self.net = nn.MultiheadAttention(num_channels, num_heads)
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         batch, channels, height, width = images.shape
         images = self.qkv_projection(images) # shape: (batch, channels * 3, height, width)
         images = images.view(batch, 3, self.num_heads, channels // self.num_heads, height * width).permute(0, 4, 1, 2, 3)
 
-        patches = typing.cast(torch.Tensor, flash_attn.flash_attn_qkvpacked_func(images))
-        patches = patches.view(batch, height * width, channels).transpose(1, 2)
-        #q, k, v = (t.view(batch, channels, height * width).transpose(1, 2) 
-        #           for t in images.chunk(3, 1))
-        #patches: torch.Tensor = self.net(q, k, v, need_weights=False)[0]
+        if flash_attn is not None:
+            patches = typing.cast(torch.Tensor, flash_attn.flash_attn_qkvpacked_func(images))
+            patches = patches.view(batch, height * width, channels).transpose(1, 2)
 
-        return patches.view(batch, channels, height, width)
+            return patches.view(batch, channels, height, width)
+
+
+        q, k, v = (t.view(batch, channels, height * width).transpose(1, 2) 
+                   for t in images.chunk(3, 1))
+        patches: torch.Tensor = self.net(q, k, v, need_weights=False)[0]
+        return patches.transpose(1, 2).view(batch, channels, height, width)
 
 
 class EncoderStage(nn.Module):
@@ -437,7 +448,7 @@ class DiffusionModel(nn.Module):
         self.alphas: torch.Tensor = 1 - self.betas
         self.alpha_bars: torch.Tensor = self.alphas.cumprod(0)
 
-        # Hack: IDE will not work without self.buffer = ... assignments,
+        # Hack: IDE will not work without self.buffer = ... assignment,
         # but torch will complain if a buffer with name already exists
         def register(name: str, buffer: torch.Tensor):
             delattr(self, name)
@@ -465,17 +476,46 @@ class DiffusionModel(nn.Module):
 
 
     @torch.inference_mode()
+    def denoise_step(self, x_t: torch.Tensor, eps_t: torch.Tensor, t: int) -> torch.Tensor:
+        alpha_bar_t_prev = torch.ones((1,)) if t == 0 else self.alpha_bars[t - 1]
+        alpha_bar_t = self.alpha_bars[t]
+        beta_t = self.betas[t]
+        alpha_t = 1 - beta_t
+
+        coeff_x_t = beta_t * (1 - alpha_bar_t).rsqrt()
+        mu_t = alpha_t.rsqrt() * (x_t - coeff_x_t * eps_t)
+        sigma_t = (1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * beta_t
+
+        eps_t_prev = torch.normal(0, 1, size=x_t.shape)
+        x_t = mu_t + sigma_t.sqrt() * eps_t_prev
+
+        return x_t
+
+
+    @torch.inference_mode()
     def generate(self, image_info: ImageInfo, label: torch.Tensor) -> torch.Tensor:
-        noise = torch.normal(0, 1, 
+        x_t = torch.normal(0, 1, 
                              size=(image_info.depth, *image_info.size), device=label.device)
 
         for t in reversed(range(self.timesteps.size(0))):
-            t = torch.full((1,), 1, device=label.device)
-            embedding = self.embed_from_label(label, t)
-            prediction = self.unet(noise, embedding)
-            noise = self.predicted_noise_to_image(noise, prediction, t)
+            timestep = torch.full(label.shape, t, device=label.device)
+            embedding = self.embed_from_label(label, timestep)
+            eps_t = self.unet(x_t, embedding)
+            x_t = self.denoise_step(x_t, eps_t, t)
 
-        return noise
+        return x_t
+
+
+    def add_noise_step(self, x_t: torch.Tensor, t: int):
+        """
+        Given x_t, compute x_t+1
+        """
+        beta_t = self.betas[t]
+        eps = torch.normal(0, 1, size=x_t.shape)
+
+        x_t_next: torch.Tensor = (1 - beta_t).sqrt() * x_t + beta_t.sqrt() * eps
+
+        return x_t_next, eps
 
 
     def add_noise(self, batch: torch.Tensor, t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
