@@ -66,13 +66,14 @@ class ResNetBlock(nn.Module):
         )
 
         if info.embedding_dim is not None:
-            if info.embedding_dim != info.out_channels:
-                self.embedding_projection_net = nn.Linear(
-                    info.embedding_dim,
-                    info.out_channels
-                )
-            else:
-                self.embedding_projection_net = nn.Identity()
+            self.embedding_projection_net = nn.Sequential(
+                nn.Linear(
+            info.embedding_dim,
+            info.out_channels
+                ),
+                nn.SiLU(inplace=True),
+                nn.Linear(info.out_channels, info.out_channels)
+            )
         else:
             self.embedding_projection_net = None
 
@@ -497,7 +498,7 @@ class DiffusionModel(nn.Module):
 
     @torch.inference_mode()
     def denoise_step(self, x_t: torch.Tensor, eps_t: torch.Tensor, t: int) -> torch.Tensor:
-        alpha_bar_t_prev = torch.ones((1,)) if t == 0 else self.alpha_bars[t - 1]
+        alpha_bar_t_prev = torch.ones((1,), device=eps_t.device) if t == 0 else self.alpha_bars[t - 1]
         alpha_bar_t = self.alpha_bars[t]
         beta_t = self.betas[t]
         alpha_t = 1 - beta_t
@@ -506,7 +507,7 @@ class DiffusionModel(nn.Module):
         mu_t = alpha_t.rsqrt() * (x_t - coeff_x_t * eps_t)
         sigma_t = (1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * beta_t
 
-        eps_t_prev = torch.normal(0, 1, size=x_t.shape)
+        eps_t_prev = torch.normal(0, 1, size=x_t.shape, device=x_t.device)
         x_t = mu_t + sigma_t.sqrt() * eps_t_prev
 
         return x_t
@@ -515,7 +516,7 @@ class DiffusionModel(nn.Module):
     @torch.inference_mode()
     def denoise(self, x_t: torch.Tensor, label: torch.Tensor):
         for t in reversed(range(self.timesteps.size(0))):
-            timestep = torch.full((label.size(0), 1), t, device=label.device)
+            timestep = torch.full((label.size(0), ), t, device=label.device)
             embedding = self.embed_from_label(label, timestep)
             eps_t = self.unet(x_t, embedding)
             x_t = self.denoise_step(x_t, eps_t, t)
@@ -524,9 +525,10 @@ class DiffusionModel(nn.Module):
 
 
     @torch.inference_mode()
-    def generate(self, image_info: ImageInfo, label: torch.Tensor) -> torch.Tensor:
+    def generate(self, size: tuple[int, int], latent_dim: int, label: torch.Tensor) -> torch.Tensor:
         x_t = torch.normal(0, 1, 
-                             size=(image_info.depth, *image_info.size), device=label.device)
+                             size=(1, latent_dim, *size), 
+                           device=label.device)
         return self.denoise(x_t, label)
 
 

@@ -1,7 +1,7 @@
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from config import DiffusionConfig, EncoderDecoderConfig, ImageInfo, VAEConfig
-from dataset import NUM_CLASS, ANDIDataset, ImageListDataset
+from dataset import AD_LABEL, NC_LABEL, NUM_CLASS, ANDIDataset, ImageListDataset
 from pathlib import Path
 from modules import VAE, DiffusionModel, DiffusionModelForwardMode
 from torch import multiprocessing as mp
@@ -741,9 +741,15 @@ class DiffusionModelController(ModelController):
 
             loss = F.mse_loss(predict_eps, true_eps)
 
+            ad_label = F.one_hot(torch.tensor([AD_LABEL]), NUM_CLASS).to(batch.device).float()
+            nc_label = F.one_hot(torch.tensor([NC_LABEL]), NUM_CLASS).to(batch.device).float()
+            height: int = self.image_info.size[0] // (2 ** sum(VAE_CONFIG.encoder_decoder_config.should_downsample))
+            width: int = self.image_info.size[1] // (2 ** sum(VAE_CONFIG.encoder_decoder_config.should_downsample))
+            size = height, width
+
             images = {
-                "Generate AD": self.diffusion_model.generate(self.image_info, torch.tensor([0, 1], device=batch.device)),
-                "Generate CN": self.diffusion_model.generate(self.image_info, torch.tensor([1, 0], device=batch.device)),
+                "Generate AD": self.diffusion_model.generate(size, VAE_CONFIG.latent_dim, ad_label),
+                "Generate CN": self.diffusion_model.generate(size, VAE_CONFIG.latent_dim, nc_label),
                 "Single step reconstruction(true)": self.vae.decode(reconstruction_true),
                 "Single step reconstruction(predict)": self.vae.decode(reconstruction_predict),
                 "Ground truth": batch,
