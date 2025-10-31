@@ -334,7 +334,7 @@ class ModelRunner:
         self.log(f"Using batch size {batch_size}")
 
         with self.summary_writer(params) as summary:
-            for epoch in range(1, params.controller.num_epochs()):
+            for epoch in range(1, 2):
                 params.model.train()
 
                 epoch_start = time.time()
@@ -392,6 +392,7 @@ class ModelRunner:
 
                 if summary is not None:
                     summary.add_scalar("Train/loss", avg_loss, global_step=epoch)
+                    summary.add_scalar("Train/learn rate", params.controller.get_lr(), global_step=epoch)
 
                     summary.add_scalar("Validation/loss", eval_stats.loss, global_step=epoch)
                     summary.add_image("Validation/images(ground truth)", 
@@ -582,7 +583,7 @@ class VAEController(ModelController):
 
 
     def get_lr(self) -> float:
-        return self.scheduler.get_lr()[0]
+        return self.scheduler.get_last_lr()[0]
 
 
     def save_path(self) -> Path:
