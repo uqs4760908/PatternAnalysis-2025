@@ -16,7 +16,6 @@ from torch.nn import functional as F
 from torch.optim import Adam, Optimizer
 from dataclasses import dataclass
 from io import StringIO
-import random
 import sys
 import functools
 import time
@@ -30,7 +29,7 @@ import os
 # From https://github.com/CompVis/latent-diffusion/blob/main/models/ldm/celeba256/config.yaml
 # and https://github.com/Stability-AI/stablediffusion/blob/main/configs/stable-diffusion/v2-inference-v.yaml
 VAE_CONFIG = VAEConfig(
-    learn_rate=1e-3,
+    learn_rate=1e-4,
     num_channels=(
         1 * 128,
         2 * 128,
@@ -308,9 +307,9 @@ class ModelRunner:
         return controller.model()
 
 
-    def make_dataloader(self, params: RunModelParams, epoch: int, seed: int = 0):
+    def make_dataloader(self, params: RunModelParams, epoch: int):
         if params.dist_params is not None:
-            sampler=DistributedSampler(params.dataset, shuffle=True, seed=seed)
+            sampler=DistributedSampler(params.dataset, shuffle=True)
             sampler.set_epoch(epoch)
         else:
             sampler = None
@@ -440,18 +439,7 @@ class ModelRunner:
 
         start = time.time()
 
-        if dist.is_initialized():
-            if dist.get_rank() == 0:
-                seed = random.randint(0, 1000000)
-                dist.send(torch.tensor([seed], device=params.device))
-            else:
-                seed = torch.zeros(1, device=params.device)
-                dist.recv(seed)
-                seed = int(seed.item())
-        else:
-            seed = 0
-
-        loader = self.make_dataloader(params, epoch=0, seed=seed)
+        loader = self.make_dataloader(params, epoch=0)
 
         input_images = torch.empty(0)
         generated_images = torch.empty(0)
