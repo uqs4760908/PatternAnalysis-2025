@@ -1,5 +1,4 @@
 import math
-from os import times
 from torch import nn
 from torch.nn import functional as F
 from config import EncoderDecoderConfig, VAEConfig, ImageInfo, DiffusionConfig
@@ -98,7 +97,7 @@ class ResNetBlock(nn.Module):
 
         skipped: torch.Tensor = self.skip_connection(batch)
         output = self.output_net(output)
-        return (output + skipped).relu()
+        return F.silu(output + skipped)
 
 
 class ResNetBlockList(SequentialWithEmbedding):
@@ -500,18 +499,22 @@ class DiffusionModel(nn.Module):
     def denoise_step(self, x_t: torch.Tensor, eps_t: torch.Tensor, t: int) -> torch.Tensor:
         alpha_bar_t = self.alpha_bars[t]
         beta_t = self.betas[t]
+        alpha_bar_t_prev = self.alpha_bars[t - 1] if t != 0 else torch.zeros((1,), device=x_t.device)
         alpha_t = 1 - beta_t
 
-        coeff_x_t = beta_t * (1 - alpha_bar_t).rsqrt()
-        mu_t = alpha_t.rsqrt() * (x_t - coeff_x_t * eps_t)
+        x_0 = alpha_bar_t.rsqrt() * (x_t - (1 - alpha_bar_t).sqrt() * eps_t)
+        x_0 = x_0.clamp(-1, 1)
+        x_0_coeff = alpha_bar_t_prev.sqrt() * beta_t / (1 - alpha_bar_t)
+
+        x_t_coeff = alpha_t.sqrt() * (1 - alpha_bar_t_prev) / (1 - alpha_bar_t)
+        mu_t = x_0_coeff * x_0 + x_t_coeff * x_t
 
         x_t = mu_t
 
         if t > 0:
-            alpha_bar_t_prev = self.alpha_bars[t - 1]
             sigma_t = (1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * beta_t
-            eps_t_prev = torch.normal(0, 1, size=x_t.shape, device=x_t.device)
-            x_t = x_t + sigma_t.sqrt() * eps_t_prev
+            eps_t_prev = torch.randn_like(x_t)
+            x_t = mu_t + sigma_t.sqrt() * eps_t_prev
 
         return x_t
 
