@@ -32,10 +32,10 @@ VAE_CONFIG = VAEConfig(
     learn_rate=1e-4,
     encoder_decoder_config=EncoderDecoderConfig(
         num_channels=(
-            1 * 128,
-            2 * 128,
-            4 * 128,
-            4 * 128 
+            1 * 64,
+            2 * 64,
+            4 * 64,
+            4 * 64
         ),
         should_downsample=(
             True,
@@ -620,7 +620,7 @@ class VAEController(ModelController):
         reconstruction: Tensor = F.mse_loss(image, generated, reduction="none").sum(dim=[1, 2, 3]).mean()
         kld: Tensor = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=[1, 2, 3]).mean()
 
-        return reconstruction + kld
+        return reconstruction + 1e-6 * kld
 
     
     def step(self, loss: Tensor) -> None:
@@ -719,7 +719,7 @@ class DiffusionModelController(ModelController):
 
 
     def num_epochs(self) -> int:
-        return 500
+        return 200
 
 
     def name(self) -> str:
