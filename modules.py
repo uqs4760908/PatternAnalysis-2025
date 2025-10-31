@@ -607,6 +607,6 @@ class DiffusionModel(nn.Module):
             t = torch.randint(0, self.denoise_steps, size=(batch.size(0),), dtype=torch.int32)
             return self.reconstruct(batch, label, t)
         else:
-            t = torch.full((batch.size(0), 1), 
-                           self.timesteps.size(0), device=batch.device)
+            t = torch.full((batch.size(0),), 
+                           self.denoise_steps - 1, device=batch.device)
             return self.reconstruct(batch, label, t)

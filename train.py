@@ -1,7 +1,7 @@
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from config import DiffusionConfig, VAEConfig
-from dataset import AD_LABEL, NUM_CLASS, ANDIDataset, ImageListDataset
+from dataset import NUM_CLASS, ANDIDataset, ImageListDataset
 from pathlib import Path
 from modules import VAE, DiffusionModel, DiffusionModelForwardMode
 from torch import multiprocessing as mp
@@ -395,15 +395,13 @@ class ModelRunner:
         avg_loss = torch.zeros(1, device=params.device, requires_grad=False)
 
         assert loader.batch_size
-        zero = torch.tensor([0, 1], device=params.device).repeat((loader.batch_size, 1))
-        ones = torch.tensor([1, 0], device=params.device).repeat((loader.batch_size, 1))
 
         for batch_idx, (batch, label) in enumerate(loader, start=1):
             with torch.autocast(device_type=params.device.type):
                 batch: Tensor = batch.to(params.device)
-                label = zero if label == AD_LABEL else ones
+                one_hot_label = F.one_hot(label, NUM_CLASS).to(params.device)
 
-                stats = params.controller.eval_batch(params.model, batch, label)
+                stats = params.controller.eval_batch(params.model, batch, one_hot_label)
             avg_loss += stats.loss / len(loader)
 
             if generated_images.shape[0] == 0:
