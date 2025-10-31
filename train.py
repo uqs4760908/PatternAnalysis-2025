@@ -436,7 +436,19 @@ class ModelRunner:
         params.model.eval()
 
         start = time.time()
-        loader = self.make_dataloader(params, epoch=0, seed=random.randint(0, 10000))
+
+        if dist.is_initialized():
+            if dist.get_rank() == 0:
+                seed = random.randint(0, 1000000)
+                dist.send(torch.tensor([seed], device=params.device))
+            else:
+                seed = torch.zeros(1, device=params.device)
+                dist.recv(seed)
+                seed = int(seed.item())
+        else:
+            seed = 0
+
+        loader = self.make_dataloader(params, epoch=0, seed=seed)
 
         input_images = torch.empty(0)
         generated_images = torch.empty(0)
