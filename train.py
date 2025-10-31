@@ -357,6 +357,9 @@ class ModelRunner:
                     self.log(f"Training: epoch [{epoch}/{params.controller.num_epochs()}] batch [{batch_idx}/{len(loader)}]")
                     self.log(f"\tLoss: {stats.loss.item()}")
 
+                    if stats.loss.isnan().item():
+                        raise Exception("NaN loss detected")
+
                     if stats.device_stats is None:
                         continue
                     
