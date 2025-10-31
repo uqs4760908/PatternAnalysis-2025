@@ -235,6 +235,7 @@ class ModelRunner:
 
         if torch.cuda.is_available():
             torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+            torch.backends.cudnn.benchmark = True
 
         if device is None:
             return
