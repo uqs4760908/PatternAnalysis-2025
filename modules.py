@@ -433,7 +433,7 @@ class DiffusionModel(nn.Module):
         return out
 
 
-    def __init__(self, config: DiffusionConfig, latent_channels: int):
+    def __init__(self, config: DiffusionConfig, latent_channels: int, num_classes: int):
         super().__init__()
 
         assert config.unet_config.embedding_dim
@@ -447,6 +447,17 @@ class DiffusionModel(nn.Module):
 
         self.alphas: torch.Tensor = 1 - self.betas
         self.alpha_bars: torch.Tensor = self.alphas.cumprod(0)
+
+        self.timesteps_projection = nn.Sequential(
+                nn.Linear(1, config.unet_config.embedding_dim),
+                nn.SiLU(inplace=True),
+                nn.Linear(config.unet_config.embedding_dim, config.unet_config.embedding_dim)
+        )
+        self.label_projection = nn.Sequential(
+                nn.Linear(num_classes, config.unet_config.embedding_dim),
+                nn.SiLU(inplace=True),
+                nn.Linear(config.unet_config.embedding_dim, config.unet_config.embedding_dim)
+        )
 
         # Hack: IDE will not work without self.buffer = ... assignment,
         # but torch will complain if a buffer with name already exists
@@ -471,7 +482,9 @@ class DiffusionModel(nn.Module):
 
     def embed_from_label(self, label: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         timesteps_embedding = self.timesteps_embeddings[t]
-        embedding = timesteps_embedding + label
+        timesteps_embedding = self.timesteps_projection(timesteps_embedding)
+        label_embedding = self.label_projection(label)
+        embedding = timesteps_embedding + label_embedding
         return embedding
 
 
