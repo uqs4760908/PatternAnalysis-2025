@@ -8,7 +8,7 @@ from torch import multiprocessing as mp
 from torch import distributed as dist
 from torch import GradScaler
 from torch.utils.tensorboard import SummaryWriter
-from torch.optim.lr_scheduler import LinearLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from torchvision import utils as vutils
 from tempfile import NamedTemporaryFile
 from torch import nn, Tensor
@@ -412,6 +412,9 @@ class ModelRunner:
                 epoch_end = time.time()
                 self.log(f"Epoch {epoch} done, took {epoch_end - epoch_start:2} seconds")
 
+            if dist.is_available():
+                dist.barrier()
+
             state = torch.load(params.controller.save_path())[MODEL_PARAMS_KEY]
             params.controller.model().load_state_dict(state)
             self.log(f"Testing...")
@@ -587,7 +590,7 @@ class VAEController(ModelController):
                               lr=VAE_CONFIG.learn_rate, fused=True, 
                               weight_decay=VAE_CONFIG.weight_decay)
         self.scaler = PortableGradScaler()
-        self.scheduler = LinearLR(self.optimiser)
+        self.scheduler = CosineAnnealingLR(self.optimiser, self.num_epochs())
 
 
     def num_epochs(self) -> int:
