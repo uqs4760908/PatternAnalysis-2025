@@ -81,7 +81,8 @@ DIFFUSION_CONFIG = DiffusionConfig(
         layer_norm_num_groups=32,
         embedding_dim=320,
         use_attention=(True,) * 4
-    )
+    ),
+    latent_scale_factor=0.18215
 )
 
 
@@ -419,9 +420,6 @@ class ModelRunner:
                                    step=epoch)
 
                 if params.is_master() and last_loss > eval_stats.loss.item():
-                    # Note: do not use params.model here since it might be DistributedDataParallel
-                    # When loading saved model we are loading params.controller.model(),
-                    # so be consistent
                     params.controller.save_model()
                     last_loss = float(eval_stats.loss.item())
 
@@ -751,10 +749,9 @@ class DiffusionModelController(ModelController):
         return DIFFUSION_CONFIG.learn_rate
 
 
-    def loss(self, t: Tensor, noise: Tensor, predict_eps: Tensor) -> Tensor:
-        loss = F.mse_loss(predict_eps, noise, reduction="none").mean([1, 2, 3])
-        scale = self.sampler.loss_scales(t)
-        return (loss * scale).mean()
+    def loss(self, noise: Tensor, predict_eps: Tensor) -> Tensor:
+        loss = F.mse_loss(predict_eps, noise)
+        return loss
 
 
     def train_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> TrainBatchStats:
@@ -768,7 +765,7 @@ class DiffusionModelController(ModelController):
                               size=(batch.size(0),), device=batch.device, dtype=torch.int32)
             x_t, noise = self.sampler.add_noise(latent, t)
             predict_eps = model(x_t, t, label)
-            loss = self.loss(t, noise, predict_eps)
+            loss = self.loss(noise, predict_eps)
 
             device_stats = DeviceStats.capture(batch.device)
 
@@ -788,7 +785,7 @@ class DiffusionModelController(ModelController):
                            device=batch.device, dtype=torch.int32)
             x_t, noise = self.sampler.add_noise(latent, t)
             predict_eps = self.ema_model(x_t, t, label)
-            loss = self.loss(t, noise, predict_eps)
+            loss = self.loss(noise, predict_eps)
 
             images = {
                 "Ground truth": batch,

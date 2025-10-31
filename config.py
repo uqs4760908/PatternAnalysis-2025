@@ -41,5 +41,6 @@ class DiffusionConfig:
     noise_start: float
     noise_end: float
     denoise_steps: int
+    latent_scale_factor: float
 
     unet_config: EncoderDecoderConfig

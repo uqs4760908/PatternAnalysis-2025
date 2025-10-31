@@ -483,7 +483,7 @@ class DiffusionModel(nn.Module):
 
 
 class DiffusionSampler(nn.Module):
-    def __init__(self, config: DiffusionConfig,):
+    def __init__(self, config: DiffusionConfig):
         super().__init__()
 
         assert config.unet_config.embedding_dim
@@ -504,18 +504,11 @@ class DiffusionSampler(nn.Module):
 
         # Coefficients for equation 7
         alpha_t_minus_one = torch.cat([torch.ones(1), alpha_bars])[:alpha_bars.size(0)]
-        beta_bars = betas * (1 - alpha_t_minus_one) / (1 - alpha_bars)
-        self.beta_bars = nn.Embedding.from_pretrained(beta_bars.unsqueeze(1))
+        self.beta_bars = self.betas
         x_0_coeff = alpha_t_minus_one.sqrt() * betas / (1 - alpha_bars)
         self.x_0_coeff = nn.Embedding.from_pretrained(x_0_coeff.unsqueeze(1))
-        x_t_coeff = alphas.sqrt() * beta_bars
+        x_t_coeff = alphas.sqrt() * (1 - alpha_t_minus_one) / (1 - alpha_bars)
         self.x_t_coeff = nn.Embedding.from_pretrained(x_t_coeff.unsqueeze(1))
-
-        # Coefficients for loss function
-        loss_scales = beta_bars.square() / (2 * beta_bars * alphas * (1 - alpha_bars))
-        # loss_scales[0] is NaN because 1 - alpha_t_minus_one[0] is 0
-        loss_scales[0] = loss_scales[1]
-        self.loss_scales = nn.Embedding.from_pretrained(loss_scales.unsqueeze(1))
 
 
     @torch.inference_mode()
