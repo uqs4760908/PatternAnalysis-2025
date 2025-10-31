@@ -20,7 +20,8 @@ class ImageListDataset(Dataset[torch.Tensor]):
         super().__init__()
         self.images = images
         with Image.open(images[0]) as image:
-            self.size = image.size
+            # PIL specifies size in (width, height). We want (height, width)
+            self.size = image.size[1], image.size[0]
             self.depth = len(image.getbands())
 
 
