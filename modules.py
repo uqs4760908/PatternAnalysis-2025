@@ -513,7 +513,7 @@ class DiffusionSampler(nn.Module):
 
         # Coefficients for loss function
         loss_scales = beta_bars.square() / (2 * beta_bars * alphas * (1 - alpha_bars))
-        self.loss_scales = nn.Embedding.from_pretrained(loss_scales)
+        self.loss_scales = nn.Embedding.from_pretrained(loss_scales.unsqueeze(1))
 
 
     @torch.inference_mode()
