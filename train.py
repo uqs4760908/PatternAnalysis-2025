@@ -15,6 +15,7 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 from torch.optim import Adam, Optimizer
 from dataclasses import dataclass
+from io import StringIO
 import functools
 import time
 import typing
@@ -214,7 +215,9 @@ class ModelRunner:
         else:
             rank = ""
 
-        print(f"[\033[42mINFO\033[0m]{rank}", *args)
+        io = StringIO()
+        print(f"[\033[42mINFO\033[0m]{rank}", *args, file=io)
+        print(io.getvalue())
 
 
     @contextlib.contextmanager
