@@ -27,6 +27,10 @@ class VAEConfig:
     weight_decay: float
     encoder_decoder_config: EncoderDecoderConfig
 
+    def output_size(self, input_size: tuple[int, int]):
+        scale = 2 ** sum(self.encoder_decoder_config.should_downsample)
+        return input_size[0] // scale, input_size[1] // scale
+
 
 @dataclass(frozen=True)
 class ImageInfo:

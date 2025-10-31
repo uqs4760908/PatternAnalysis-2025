@@ -788,9 +788,7 @@ class DiffusionModelController(ModelController):
         with torch.autocast(device_type=batch.device.type):
             ad_label = F.one_hot(torch.tensor([AD_LABEL]), NUM_CLASS).to(batch.device).float()
             nc_label = F.one_hot(torch.tensor([NC_LABEL]), NUM_CLASS).to(batch.device).float()
-            height: int = self.image_info.size[0] // (2 ** sum(VAE_CONFIG.encoder_decoder_config.should_downsample))
-            width: int = self.image_info.size[1] // (2 ** sum(VAE_CONFIG.encoder_decoder_config.should_downsample))
-            size = height, width
+            size = VAE_CONFIG.output_size(self.image_info.size)
 
             ad_latent = self.sampler.generate(n, size, 
                                               VAE_CONFIG.latent_dim, ad_label, self.ema_model)
