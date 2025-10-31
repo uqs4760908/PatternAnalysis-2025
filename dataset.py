@@ -16,6 +16,7 @@ TRANSFORM = ToDtype(dtype=torch.float32, scale=True)
 
 AD_LABEL = 0
 NC_LABEL = 1
+NUM_CLASS = 2
 Item = tuple[torch.Tensor, int]
 
 

@@ -43,38 +43,7 @@ class ConvBlock(nn.Module):
         return self.net(batch)
 
 
-class ConvTransposeBlock(nn.Module):
-  """
-  A ConvTranspose2d that doubles its inputs size
-  ConvTransposeBlock(height, width) -> (height * 2, width * 2)
-  """
-
-  def __init__(self, in_channels: int, 
-               out_channels: int, 
-               kernel_size: int = 3,
-               stride: int = 2,
-               padding: int = 1,
-               num_groups: int = 32,
-               output_padding: int = 1):
-      super().__init__()
-
-      self.net = nn.Sequential(
-              nn.ConvTranspose2d(in_channels, 
-                                 out_channels, 
-                                 kernel_size=kernel_size,
-                                 padding=padding,
-                                 output_padding=output_padding,
-                                 stride=stride,
-                                 bias=False),
-              nn.GroupNorm(num_groups, out_channels),
-              nn.SiLU(inplace=True),
-      )
-
-  def forward(self, batch: torch.Tensor) -> torch.Tensor:
-      return self.net(batch)
-
-
-class Sequential2(nn.ModuleList):
+class SequentialWithEmbedding(nn.ModuleList):
     def __init__(self, *layers: nn.Module):
         super().__init__(layers)
 
@@ -101,10 +70,10 @@ class ResNetBlock(nn.Module):
         )
 
         if embedding_dim is not None:
-            if in_channels != out_channels:
+            if embedding_dim != out_channels:
                 self.embedding_projection_net = nn.Linear(
-                        out_channels,
-                        embedding_dim  
+                        embedding_dim,
+                        out_channels
                 )
             else:
                 self.embedding_projection_net = nn.Identity()
@@ -121,8 +90,9 @@ class ResNetBlock(nn.Module):
     def forward(self, batch: torch.Tensor, embedding: typing.Optional[torch.Tensor]=None) -> torch.Tensor:
         output: torch.Tensor = self.input_net(batch)
 
-        if embedding and self.embedding_projection_net:
-            embedding_projection = self.embedding_projection_net(embedding)
+        if embedding is not None and self.embedding_projection_net:
+            embedding_projection: torch.Tensor = self.embedding_projection_net(embedding)
+            embedding_projection = embedding_projection.view(*embedding_projection.shape[:2], 1, 1)
             output = output + embedding_projection
 
         skipped: torch.Tensor = self.skip_connection(batch)
@@ -130,7 +100,7 @@ class ResNetBlock(nn.Module):
         return (output + skipped).relu()
 
 
-class ResNetBlockList(Sequential2):
+class ResNetBlockList(SequentialWithEmbedding):
     def __init__(self, 
                  num_blocks: int, 
                  in_channels: int, 
@@ -171,7 +141,8 @@ class EncoderStage(nn.Module):
                  num_groups: int,
                  num_heads: int,
                  use_attention: bool,
-                 embedding_dim: typing.Optional[int]):
+                 embedding_dim: typing.Optional[int],
+                 should_downsample: tuple[bool, bool]):
         super().__init__()
 
         self.resnet_list = ResNetBlockList(
@@ -186,7 +157,7 @@ class EncoderStage(nn.Module):
         else:
             self.transformer = nn.Identity()
 
-        self.avgpool = nn.AvgPool2d(kernel_size=2)
+        self.avgpool = nn.AvgPool2d(kernel_size=(should_downsample[0] + 1, should_downsample[1] + 1))
 
 
     def forward(self, batch: torch.Tensor, embedding: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -204,7 +175,8 @@ class DecoderStage(nn.Module):
                  num_groups: int,
                  num_heads: int,
                  use_attention: int,
-                 embedding_dim: typing.Optional[int]):
+                 embedding_dim: typing.Optional[int],
+                 should_upsample: tuple[bool, bool]):
         super().__init__()
 
         self.resnet_list = ResNetBlockList(num_resnet_blocks, 
@@ -218,15 +190,27 @@ class DecoderStage(nn.Module):
         else:
             self.transformer = nn.Identity()
 
-        self.upsampler = ConvTransposeBlock(out_channels, 
-                                                 out_channels, 
-                                                 num_groups=num_groups)
-    
+        self.upsampler = nn.Sequential(
+                nn.ConvTranspose2d(
+                    out_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=(should_upsample[0] + 1, should_upsample[1] + 1),
+                    padding=1,
+                    output_padding=(int(should_upsample[0]), int(should_upsample[1])),
+                    bias=False
+                ),
+                nn.GroupNorm(num_groups, out_channels),
+                nn.SiLU(inplace=True)
+        )
 
-    def forward(self, images: torch.Tensor, embedding: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
-        output: torch.Tensor = self.resnet_list(images, embedding)
+
+
+    def forward(self, batch: torch.Tensor, embedding: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
+        output: torch.Tensor = self.resnet_list(batch, embedding)
         output = self.transformer(output)
-        return self.upsampler(output)
+        output = self.upsampler(output)
+        return output
 
 
 class Autoencoder(abc.ABC):
@@ -237,57 +221,72 @@ class Autoencoder(abc.ABC):
     def decode(self, latent_vector: torch.Tensor) -> torch.Tensor: ...
 
 
-class DownsamplePass(Sequential2):
+class DownsamplePass(nn.Module):
     def __init__(self, 
                  in_channels: int, 
-                 num_channels: tuple[int, ...],
+                 num_channels: typing.Sequence[int],
                  num_resnet_blocks: int,
                  layer_norm_num_groups: int,
                  num_attention_heads: int,
-                 use_attention_for_block: typing.Sequence[bool],
-                 embedding_dim: typing.Optional[int]):
+                 use_attention_in_block: typing.Sequence[bool],
+                 embedding_dim: typing.Optional[int],
+                 should_downsample_in_block: typing.Sequence[tuple[bool, bool]]):
+        super().__init__()
+
+        if in_channels != num_channels[0]:
+            self.project_channels = nn.Conv2d(
+                    in_channels,
+                    num_channels[0],
+                    kernel_size=3,
+                    padding=1)
+        else:
+            self.project_channels = nn.Identity()
+
         layers: list[nn.Module] = []
 
-        for i in range(len(num_channels) - 1):
-            in_channels = num_channels[i]
-            out_channels = num_channels[i + 1]
+        out_channels_list = (*num_channels[1:], num_channels[-1])
+        for in_channels, out_channels, should_downsample, use_attention in zip(
+                                                                                num_channels, 
+                                                                                out_channels_list, 
+                                                                                should_downsample_in_block, 
+                                                                                use_attention_in_block):
             layers.append(EncoderStage(in_channels, 
                                        out_channels, 
                                        num_resnet_blocks, 
                                        layer_norm_num_groups,
                                        num_attention_heads, 
-                                       use_attention_for_block[i],
-                                       embedding_dim))
+                                       use_attention,
+                                       embedding_dim,
+                                       should_downsample))
 
-        super().__init__(*layers)
+        self.net = SequentialWithEmbedding(*layers)
+
+
+    def forward(self, batch: torch.Tensor, embedding: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
+        output = self.project_channels(batch)
+        output = self.net(output, embedding)
+        return output
 
 
 class AutoEncoder(nn.Sequential):
     def __init__(self, 
                  in_channels: int, 
-                 num_channels: tuple[int, ...],
+                 num_channels: typing.Sequence[int],
                  num_resnet_blocks: int,
                  layer_norm_num_groups: int,
-                 num_attention_heads: int):
+                 num_attention_heads: int,
+                 should_downsample_in_block: typing.Sequence[tuple[bool, bool]]):
         deep_num_channels = num_channels[-1]
 
-        if in_channels != num_channels[0]:
-            project_channels = nn.Conv2d(in_channels,
-                  num_channels[0],
-                  kernel_size=3,
-                  padding=1)
-        else:
-            project_channels = nn.Identity()
-
         layers = (
-                project_channels,
             DownsamplePass(in_channels, 
                            num_channels, 
                            num_resnet_blocks,
                            layer_norm_num_groups,
                            num_attention_heads,
                            (False,) * len(num_channels),
-                           None),
+                           None,
+                           should_downsample_in_block),
             ResNetBlock(deep_num_channels, deep_num_channels, 
                         layer_norm_num_groups, None),
             PixelTransformer(deep_num_channels, num_attention_heads),
@@ -297,37 +296,64 @@ class AutoEncoder(nn.Sequential):
         super().__init__(*layers)
 
 
-class UpsamplePass(Sequential2):
+class UpsamplePass(nn.Module):
     def __init__(self, 
                  out_channels: int, 
-                 num_channels: tuple[int, ...],
+                 num_channels: typing.Sequence[int],
                  num_resnet_blocks: int,
                  layer_norm_num_groups: int,
                  num_attention_heads: int,
                  use_attention_for_block: typing.Sequence[bool],
-                 embedding_dim: typing.Optional[int]):
+                 embedding_dim: typing.Optional[int],
+                 should_upsample_in_block: typing.Sequence[tuple[bool, bool]]):
+        super().__init__()
+
         layers: list[nn.Module] = []
 
-        for i in reversed(range(len(num_channels) - 1)):
-            in_channels = num_channels[i + 1]
-            out_channels = num_channels[i]
+        in_channels_list = (*num_channels[1:], num_channels[-1])
+
+        if out_channels != num_channels[0]:
+            self.project_channels = nn.Conv2d(
+                    num_channels[0],
+                    out_channels,
+                    kernel_size=3,
+                    padding=1
+            )
+        else:
+            self.project_channels = nn.Identity()
+
+        for in_channels, out_channels, use_attention, should_upsample in reversed((*zip(
+                                                                                in_channels_list, 
+                                                                                num_channels, 
+                                                                                use_attention_for_block, 
+                                                                                should_upsample_in_block),)):
             layers.append(DecoderStage(in_channels, 
                                        out_channels, 
                                        num_resnet_blocks,
                                        layer_norm_num_groups,
                                        num_attention_heads,
-                                       use_attention_for_block[i],
-                                       embedding_dim))
-        super().__init__(*layers)
+                                       use_attention,
+                                       embedding_dim,
+                                       should_upsample))
+
+
+        self.net = SequentialWithEmbedding(*layers)
+
+
+    def forward(self, batch: torch.Tensor, embedding: typing.Optional[torch.Tensor] = None) -> torch.Tensor:
+        output = self.net(batch, embedding)
+        output = self.project_channels(output)
+        return output
 
 
 class AutoDecoder(nn.Module):
     def __init__(self, 
                  out_channels: int, 
-                 num_channels: tuple[int, ...],
+                 num_channels: typing.Sequence[int],
                  num_resnet_blocks: int,
                  layer_norm_num_groups: int,
-                 num_attention_heads: int):
+                 num_attention_heads: int,
+                 should_upsample_in_block: typing.Sequence[tuple[bool, bool]]):
         super().__init__()
 
         deep_num_channels = num_channels[-1]
@@ -343,13 +369,8 @@ class AutoDecoder(nn.Module):
                              layer_norm_num_groups,
                              num_attention_heads,
                              (False,) * len(num_channels),
-                             None),
-                nn.Conv2d(
-                        in_channels=num_channels[0],
-                        out_channels=out_channels,
-                        kernel_size=3,
-                        padding=1
-                    ),
+                             None,
+                             should_upsample_in_block),
                 nn.Sigmoid()
         )
 
@@ -369,7 +390,8 @@ class VAE(nn.Module, Autoencoder):
                 config.num_channels,
                 config.num_resnet_blocks,
                 config.layer_norm_num_groups,
-                num_attention_heads=config.num_attention_heads
+                num_attention_heads=config.num_attention_heads,
+                should_downsample_in_block=config.should_downsample_in_block
         )
         self.feature_to_mean_logvar = nn.Conv2d(
                 in_channels=config.num_channels[-1],
@@ -389,7 +411,8 @@ class VAE(nn.Module, Autoencoder):
                 config.num_channels,
                 config.num_resnet_blocks,
                 config.layer_norm_num_groups,
-                config.num_attention_heads
+                config.num_attention_heads,
+                config.should_downsample_in_block
         )
 
 
@@ -439,7 +462,8 @@ class UNet(nn.Module):
                 config.layer_norm_num_groups,
                 config.num_attention_heads,
                 (True,) * len(config.num_channels),
-                num_classes
+                num_classes,
+                should_downsample_in_block=config.should_downsample_in_block
         )
         self.middle = nn.Sequential(
                 ResNetBlock(
@@ -466,7 +490,8 @@ class UNet(nn.Module):
                 config.layer_norm_num_groups,
                 config.num_attention_heads,
                 (True,) * len(config.num_channels),
-                num_classes
+                num_classes,
+                config.should_downsample_in_block
         )
 
 
@@ -497,7 +522,7 @@ class DiffusionModel(nn.Module):
     @staticmethod
     @torch.no_grad
     def generate_timesteps_embeddings(timesteps: torch.Tensor, embedding_size: int):
-        out = torch.empty_like(timesteps)
+        out = torch.empty((timesteps.size(0), embedding_size), device=timesteps.device)
 
         denomator = torch.pow(timesteps.size(0), 2 * (torch.arange(0, embedding_size) & -2))
         numerator = timesteps.reshape(timesteps.size(0), 1)
@@ -523,24 +548,30 @@ class DiffusionModel(nn.Module):
         self.alphas: torch.Tensor = 1 - self.betas
         self.alpha_bars: torch.Tensor = self.alphas.cumprod(0)
 
-        self.register_buffer("timesteps", self.timesteps)
-        self.register_buffer("timesteps_embeddings", self.timesteps_embeddings)
-        self.register_buffer("betas", self.betas)
-        self.register_buffer("alphas", self.alphas)
-        self.register_buffer("alpha_bars", self.alpha_bars)
+        # Hack: IDE will not work without self.buffer = ... assignments,
+        # but torch will complain if a buffer with name already exists
+        def register(name: str, buffer: torch.Tensor):
+            delattr(self, name)
+            self.register_buffer(name, buffer)
+
+        register("timesteps", self.timesteps)
+        register("timesteps_embeddings", self.timesteps_embeddings)
+        register("betas", self.betas)
+        register("alphas", self.alphas)
+        register("alpha_bars", self.alpha_bars)
 
 
     @torch.inference_mode()
-    def predicted_noise_to_image(self, noise: torch.Tensor, eps: torch.Tensor, t: int) -> torch.Tensor:
-        beta_t = self.betas[t]
+    def predicted_noise_to_image(self, noise: torch.Tensor, eps: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        beta_t = self.betas[t].view(noise.size(0), 1, 1, 1)
         alpha_t = 1 - beta_t
-        alpha_bar_t = self.alpha_bars[t]
+        alpha_bar_t = self.alpha_bars[t].view(noise.size(0), 1, 1, 1)
 
         x_0 = (beta_t / (1 - alpha_bar_t).sqrt()) * eps
         return (1 / alpha_t.sqrt()) * (noise - x_0)
 
 
-    def embed_from_label(self, label: torch.Tensor, t: int) -> torch.Tensor:
+    def embed_from_label(self, label: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         timesteps_embedding = self.timesteps_embeddings[t]
         embedding = timesteps_embedding + label
         return embedding
@@ -551,6 +582,7 @@ class DiffusionModel(nn.Module):
                              size=(image_info.depth, *image_info.size), device=self.timesteps.device)
 
         for t in reversed(range(self.timesteps.size(0))):
+            t = torch.full((1,), 1, device=label.device)
             embedding = self.embed_from_label(label, t)
             prediction = self.unet(noise, embedding)
             noise = self.predicted_noise_to_image(noise, prediction, t)
@@ -558,11 +590,11 @@ class DiffusionModel(nn.Module):
         return noise
 
 
-    def reconstruct(self, batch: torch.Tensor, label: torch.Tensor, t: int):
-        eps = torch.normal(0, 1, size=batch.shape[1:], device=batch.device)
+    def reconstruct(self, batch: torch.Tensor, label: torch.Tensor, t: torch.Tensor):
+        eps = torch.normal(0, 1, size=batch.shape, device=batch.device)
         embedding = self.embed_from_label(label, t)
 
-        alpha_bar = self.alpha_bars[t]
+        alpha_bar = self.alpha_bars[t].view(t.size(0), 1, 1, 1)
         x_t = alpha_bar.sqrt() * batch + alpha_bar * eps
 
         prediction: torch.Tensor = self.unet(x_t, embedding)
@@ -572,7 +604,9 @@ class DiffusionModel(nn.Module):
 
     def forward(self, batch: torch.Tensor, label: torch.Tensor, mode: DiffusionModelForwardMode):
         if mode == DiffusionModelForwardMode.TRAIN:
-            t = int(torch.randint(0, self.denoise_steps, size=(batch.size(0),)).int().item())
+            t = torch.randint(0, self.denoise_steps, size=(batch.size(0),), dtype=torch.int32)
             return self.reconstruct(batch, label, t)
         else:
-            return self.reconstruct(batch, label, self.timesteps.size(0))
+            t = torch.full((batch.size(0), 1), 
+                           self.timesteps.size(0), device=batch.device)
+            return self.reconstruct(batch, label, t)

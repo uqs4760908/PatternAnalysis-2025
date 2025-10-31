@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import typing
 
 
 @dataclass(frozen=True, slots=True)
@@ -9,6 +10,7 @@ class VAEConfig:
     num_resnet_blocks: int
     num_attention_heads: int
     layer_norm_num_groups: int
+    should_downsample_in_block: typing.Sequence[tuple[bool, bool]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,3 +29,4 @@ class DiffusionConfig:
     num_resnet_blocks: int
     num_attention_heads: int
     layer_norm_num_groups: int
+    should_downsample_in_block: typing.Sequence[tuple[bool, bool]]

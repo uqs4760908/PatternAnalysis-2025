@@ -1,7 +1,7 @@
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from config import DiffusionConfig, VAEConfig
-from dataset import AD_LABEL, ANDIDataset, ImageListDataset
+from dataset import AD_LABEL, NUM_CLASS, ANDIDataset, ImageListDataset
 from pathlib import Path
 from modules import VAE, DiffusionModel, DiffusionModelForwardMode
 from torch import multiprocessing as mp
@@ -39,7 +39,13 @@ VAE_CONFIG = VAEConfig(
     latent_dim=4,
     num_resnet_blocks=2,
     num_attention_heads=1,
-    layer_norm_num_groups=32
+    layer_norm_num_groups=32,
+    should_downsample_in_block=(
+        (True, True),
+        (True, True),
+        (False, True),
+        (False, False)
+    )
 )
 
 DIFFUSION_CONFIG = DiffusionConfig(
@@ -56,7 +62,13 @@ DIFFUSION_CONFIG = DiffusionConfig(
 
     noise_start=0.00085,
     noise_end=0.0120,
-    denoise_steps=1000
+    denoise_steps=1000,
+    should_downsample_in_block=(
+        (True, True),
+        (True, True),
+        (False, True),
+        (False, False)
+    )
 )
 
 
@@ -132,6 +144,10 @@ class ModelController(abc.ABC):
     """
     @abc.abstractmethod
     def model(self) -> nn.Module: ...
+
+
+    def dependent_models(self) -> typing.Sequence[nn.Module]:
+        return ()
 
 
     @abc.abstractmethod
@@ -261,6 +277,12 @@ class ModelRunner:
         return model
 
 
+    def optimise_controller(self, controller: ModelController, device: torch.device):
+        for model in [controller.model(), *controller.dependent_models()]:
+            self.optimise_model(model, device)
+        return controller.model()
+
+
     def make_dataloader(self, params: RunModelParams):
         if params.dist_params is not None:
             sampler=DistributedSampler(params.dataset)
@@ -268,7 +290,7 @@ class ModelRunner:
             sampler = None
 
         loader = DataLoader(params.dataset, 
-                            batch_size=self.batch_size(params.model, params.device), 
+                            batch_size=self.batch_size(params.controller ,params.model, params.device), 
                             shuffle=True, 
                             sampler=sampler,
                             num_workers=os.cpu_count() or 0)
@@ -284,7 +306,7 @@ class ModelRunner:
 
     def train_loop(self, params: RunModelParams):
         loader, sampler = self.make_dataloader(params)
-        batch_size = self.batch_size(params.model, params.device)
+        batch_size = self.batch_size(params.controller, params.model, params.device)
         self.logger.info(f"[{os.getpid()} {params.device}]: Using batch size {batch_size}")
 
         with self.summary_writer(params) as summary:
@@ -297,15 +319,12 @@ class ModelRunner:
                     sampler.set_epoch(epoch)
 
                 avg_loss = torch.zeros(1, device=params.device, requires_grad=False)
-                zero = torch.tensor([0, 1], device=params.device).repeat((batch_size, 1))
-                ones = torch.tensor([1, 0], device=params.device).repeat((batch_size, 1))
 
                 for batch_idx, (batch, label) in enumerate(loader, start=1):
                     batch: Tensor = batch.to(params.device)
-                    label: Tensor = label.to(params.device)
-                    label = zero if label == AD_LABEL else ones
+                    one_hot_label = F.one_hot(label, NUM_CLASS).to(params.device)
 
-                    stats = params.controller.train_batch(params.model, batch, label)
+                    stats = params.controller.train_batch(params.model, batch, one_hot_label)
                     avg_loss += stats.loss / len(loader)
 
                     if (batch_idx % 50) == 0:
@@ -388,7 +407,7 @@ class ModelRunner:
             avg_loss += stats.loss / len(loader)
 
             if generated_images.shape[0] == 0:
-                num_images = min(self.batch_size(params.model, params.device), 8)
+                num_images = min(self.batch_size(params.controller, params.model, params.device), 8)
                 generated_images = stats.generated_images[:num_images]
                 input_images = batch[:num_images]
 
@@ -413,7 +432,7 @@ class ModelRunner:
         with self.setup(rank, world_size, file):
             accelerator = get_accelerator()
             device = torch.device(f"{accelerator.type}:{rank}")
-            model = self.optimise_model(controller.model(), device)
+            model = self.optimise_controller(controller, device)
             model = nn.parallel.DistributedDataParallel(model)
 
             fn(RunModelParams(
@@ -450,7 +469,7 @@ class ModelRunner:
         # mps does not support DistributedDataParallel
         if nprocs == 1 or device and device.type == "mps":
             fn(RunModelParams(
-                model=self.optimise_model(controller.model(), device),
+                model=self.optimise_controller(controller, device),
                 device=device,
                 dataset=dataset,
                 dist_params=None,
@@ -513,7 +532,7 @@ class VAEController(ModelController):
 
 
     def train_batch(self, model: nn.Module, batch: Tensor, label: torch.Tensor) -> RunStats:
-        with torch.autocast(device_type=str(batch.device)):
+        with torch.autocast(device_type=batch.device.type):
             generated, mu, logvar = model(batch)
 
             loss = self.loss_fn(batch, generated, mu, logvar)
@@ -526,7 +545,7 @@ class VAEController(ModelController):
 
     
     def eval_batch(self, model: nn.Module, batch: Tensor, label: torch.Tensor) -> RunStats:
-        with torch.autocast(device_type=str(batch.device)):
+        with torch.autocast(device_type=batch.device.type):
             generated, mu, logvar = model(batch)
 
             loss = self.loss_fn(batch, generated, mu, logvar)
@@ -541,26 +560,33 @@ class DiffusionModelController(ModelController):
     def __init__(self, vae: VAE):
         super().__init__()
 
-        self.diffusion = DiffusionModel(
+        self.diffusion_model = DiffusionModel(
                 DIFFUSION_CONFIG, 
                 VAE_CONFIG.latent_dim, 
                 num_classes=2)
         self.vae = vae
-        self.optimiser = Adam(self.diffusion.parameters(), DIFFUSION_CONFIG.learn_rate)
+        self.optimiser = Adam(self.diffusion_model.parameters(), DIFFUSION_CONFIG.learn_rate)
         self.scaler = PortableGradScaler()
 
 
     def model(self) -> nn.Module:
-        return self.diffusion
+        return self.diffusion_model
 
 
     def num_epochs(self) -> int:
         return 30
 
 
+    def dependent_models(self) -> typing.Sequence[nn.Module]:
+        return (self.vae,)
+
+
     def train_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> RunStats:
+        self.vae.eval()
+
         with torch.autocast(device_type=batch.device.type):
-            latent = self.vae.encode(batch)
+            with torch.no_grad():
+                latent = self.vae.encode(batch)
             t, true_eps, predict_eps, noisy_image = model(latent, 
                                                          label, 
                                                          DiffusionModelForwardMode.TRAIN)
@@ -570,12 +596,12 @@ class DiffusionModelController(ModelController):
         self.scaler.scale(loss)
         self.scaler.update(self.optimiser)
 
-
-        latent_images = self.diffusion.predicted_noise_to_image(
-            noisy_image, 
-            predict_eps, 
-            t)
-        images = self.vae.decode(latent_images)
+        with torch.no_grad():
+            latent_images = self.diffusion_model.predicted_noise_to_image(
+                noisy_image, 
+                predict_eps, 
+                t)
+            images = self.vae.decode(latent_images)
         return RunStats(loss=loss, 
                         generated_images=images)
 
@@ -588,7 +614,7 @@ class DiffusionModelController(ModelController):
                                                          label, 
                                                          DiffusionModelForwardMode.EVAL)
 
-            latent_images = self.diffusion.predicted_noise_to_image(
+            latent_images = self.diffusion_model.predicted_noise_to_image(
                 noisy_image, 
                 predict_eps, 
                 t)
