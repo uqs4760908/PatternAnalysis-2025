@@ -128,7 +128,13 @@ class DeviceStats:
 
 
 @dataclass(frozen=True, slots=True)
-class RunStats:
+class TrainBatchStats:
+    loss: Tensor
+    device_stats: typing.Optional[DeviceStats]
+
+
+@dataclass(frozen=True, slots=True)
+class EvalBatchStats:
     loss: Tensor
     generated_images: Tensor
     device_stats: typing.Optional[DeviceStats]
@@ -162,11 +168,11 @@ class ModelController(abc.ABC):
 
     
     @abc.abstractmethod
-    def train_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> RunStats: ...
+    def train_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> TrainBatchStats: ...
 
 
     @abc.abstractmethod
-    def eval_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> RunStats: ...
+    def eval_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> EvalBatchStats: ...
 
     
     @abc.abstractmethod
@@ -557,7 +563,7 @@ class VAEController(ModelController):
         return Path("vae.pth")
 
 
-    def train_batch(self, model: nn.Module, batch: Tensor, label: torch.Tensor) -> RunStats:
+    def train_batch(self, model: nn.Module, batch: Tensor, label: torch.Tensor) -> TrainBatchStats:
         with torch.autocast(device_type=batch.device.type):
             generated, mu, logvar = model(batch)
 
@@ -568,15 +574,15 @@ class VAEController(ModelController):
         nn.utils.clip_grad_norm_(self.vae.parameters(), max_norm=1)
         self.scaler.update(self.optimiser)
 
-        return RunStats(loss=loss, generated_images=generated, device_stats=device_stats)
+        return TrainBatchStats(loss=loss, device_stats=device_stats)
 
     
-    def eval_batch(self, model: nn.Module, batch: Tensor, label: torch.Tensor) -> RunStats:
+    def eval_batch(self, model: nn.Module, batch: Tensor, label: torch.Tensor) -> EvalBatchStats:
         with torch.autocast(device_type=batch.device.type):
             generated, mu, logvar = model(batch)
 
             loss = self.loss_fn(batch, generated, mu, logvar)
-            return RunStats(loss=loss, generated_images=generated, device_stats=DeviceStats.capture(batch.device))
+            return EvalBatchStats(loss=loss, generated_images=generated, device_stats=DeviceStats.capture(batch.device))
 
 
     def model(self) -> nn.Module:
@@ -613,7 +619,7 @@ class DiffusionModelController(ModelController):
         self.scheduler.step(loss)
 
 
-    def train_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> RunStats:
+    def train_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> TrainBatchStats:
         self.vae.eval()
 
         with torch.autocast(device_type=batch.device.type):
@@ -630,20 +636,12 @@ class DiffusionModelController(ModelController):
         self.scaler.scale(loss)
         self.scaler.update(self.optimiser)
 
-        with torch.no_grad():
-            latent_images = self.diffusion_model.predicted_noise_to_image(
-                noisy_image, 
-                predict_eps, 
-                t)
-            images = self.vae.decode(latent_images)
-
-        return RunStats(loss=loss, 
-                        generated_images=images,
+        return TrainBatchStats(loss=loss, 
                         device_stats=device_stats)
 
 
     @torch.inference_mode()
-    def eval_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> RunStats:
+    def eval_batch(self, model: nn.Module, batch: Tensor, label: Tensor) -> EvalBatchStats:
         with torch.autocast(device_type=batch.device.type):
             latent = self.vae.encode(batch)
             t, true_eps, predict_eps, noisy_image = model(latent, 
@@ -656,7 +654,7 @@ class DiffusionModelController(ModelController):
                 t)
             images = self.vae.decode(latent_images)
             loss = F.mse_loss(batch, images)
-            return RunStats(loss=loss, 
+            return EvalBatchStats(loss=loss, 
                             generated_images=images,
                             device_stats=DeviceStats.capture(batch.device))
 
