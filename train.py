@@ -423,6 +423,7 @@ class ModelRunner:
 
         assert loader.batch_size
 
+
         for batch_idx, (batch, label) in enumerate(loader, start=1):
             with torch.autocast(device_type=params.device.type):
                 batch: Tensor = batch.to(params.device)
@@ -492,7 +493,7 @@ class ModelRunner:
             self.log(f"Found {nprocs} devices")
 
         # mps does not support DistributedDataParallel
-        if nprocs == 1 or device and device.type == "mps":
+        if nprocs == 1 or (device and device.type == "mps"):
             fn(RunModelParams(
                 model=self.optimise_controller(controller, device),
                 device=device,
