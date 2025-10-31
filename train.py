@@ -717,7 +717,7 @@ class DiffusionModelController(ModelController):
 
 
     def num_epochs(self) -> int:
-        return 200
+        return 100
 
 
     def name(self) -> str:
@@ -804,11 +804,11 @@ class DiffusionModelController(ModelController):
 
         
     def load_model(self):
-        self.ema_model.load_state_dict(torch.load(self.EMA_MODEL_PATH, weights_only=True))
+        self.ema_model.module.load_state_dict(torch.load(self.EMA_MODEL_PATH, weights_only=True))
 
 
     def save_model(self):
-        torch.save(self.ema_model.state_dict(), self.EMA_MODEL_PATH)
+        torch.save(self.ema_model.module.state_dict(), self.EMA_MODEL_PATH)
 
 
 def main():
