@@ -612,6 +612,7 @@ class DiffusionModel(nn.Module):
         return embedding
 
 
+    @torch.inference_mode()
     def generate(self, image_info: ImageInfo, label: torch.Tensor) -> torch.Tensor:
         noise = torch.normal(0, 1, 
                              size=(image_info.depth, *image_info.size), device=self.timesteps.device)
