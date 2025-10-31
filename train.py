@@ -729,10 +729,10 @@ class DiffusionModelController(ModelController):
             t, true_eps, predict_eps, noisy_image = model(latent, 
                                                          label, 
                                                          DiffusionModelForwardMode.EVAL)
-            t = torch.full((batch.size(0), ), 
-                           DIFFUSION_CONFIG.denoise_steps, 
+            full_t = torch.full((batch.size(0), 1), 
+                           DIFFUSION_CONFIG.denoise_steps - 1, 
                            device=batch.device)
-            x_t, noise = self.diffusion_model.add_noise(latent, t)
+            x_t, noise = self.diffusion_model.add_noise(latent, full_t)
 
             reconstruction_true = self.diffusion_model.predicted_noise_to_image(noisy_image, true_eps, t)
             reconstruction_predict = self.diffusion_model.predicted_noise_to_image(noisy_image, predict_eps, t)
