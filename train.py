@@ -334,6 +334,8 @@ class ModelRunner:
         self.log(f"Using batch size {batch_size}")
 
         with self.summary_writer(params) as summary:
+            last_loss = float("inf")
+
             for epoch in range(1, params.controller.num_epochs() + 1):
                 params.model.train()
 
@@ -372,15 +374,6 @@ class ModelRunner:
                         summary.add_scalar("Train/GPU temperature(C)", stats.device_stats.temperature, step)
                         summary.add_scalar("Train/GPU memory allocated(GB)", stats.device_stats.memory_allocated / (2 ** 30), step)
 
-                if params.is_master():
-                    # Note: do not use params.model here since it might be DistributedDataParallel
-                    # When loading saved model we are loading params.controller.model(),
-                    # so be consistent
-                    torch.save({
-                        TRAIN_STATUS_KEY: TRAIN_STATUS_TRAINING,
-                        MODEL_PARAMS_KEY: params.controller.model().state_dict()
-                    }, params.controller.save_path())
-
                 if params.dist_params is not None:
                     dist.barrier()
                 self.log(f"Validating...")
@@ -391,6 +384,16 @@ class ModelRunner:
                     dist_params=params.dist_params,
                     controller=params.controller
                 ), tag="Validation")
+
+                if params.is_master() and last_loss > eval_stats.loss.item():
+                    # Note: do not use params.model here since it might be DistributedDataParallel
+                    # When loading saved model we are loading params.controller.model(),
+                    # so be consistent
+                    torch.save({
+                        TRAIN_STATUS_KEY: TRAIN_STATUS_TRAINING if epoch < params.controller.num_epochs() - 1 else TRAIN_STATUS_DONE,
+                        MODEL_PARAMS_KEY: params.controller.model().state_dict()
+                    }, params.controller.save_path())
+                    last_loss = float(eval_stats.loss.item())
 
                 if summary is not None:
                     summary.add_scalar("Train/loss", avg_loss, global_step=epoch)
@@ -407,11 +410,6 @@ class ModelRunner:
                 params.controller.step(eval_stats.loss)
                 epoch_end = time.time()
                 self.log(f"Epoch {epoch} done, took {epoch_end - epoch_start:2} seconds")
-
-            torch.save({
-                TRAIN_STATUS_KEY: TRAIN_STATUS_DONE,
-                MODEL_PARAMS_KEY: params.controller.model().state_dict()
-            }, params.controller.save_path())
 
             if params.dist_params is not None:
                 dist.barrier()
