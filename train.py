@@ -380,7 +380,8 @@ class ModelRunner:
                         MODEL_PARAMS_KEY: params.controller.model().state_dict()
                     }, params.controller.save_path())
 
-                dist.barrier()
+                if params.dist_params is not None:
+                    dist.barrier()
                 self.log(f"Validating...")
                 eval_stats = self.eval_loop(RunModelParams(
                     model=params.model,
@@ -410,7 +411,9 @@ class ModelRunner:
                 TRAIN_STATUS_KEY: TRAIN_STATUS_DONE,
                 MODEL_PARAMS_KEY: params.controller.model().state_dict()
             }, params.controller.save_path())
-            dist.barrier()
+
+            if params.dist_params is not None:
+                dist.barrier()
 
             self.log(f"Testing...")
             test_stats = self.eval_loop(RunModelParams(
