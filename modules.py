@@ -464,7 +464,6 @@ class DiffusionModel(nn.Module):
                 nn.SiLU(inplace=True),
                 nn.Linear(config.unet_config.embedding_dim, config.unet_config.embedding_dim)
         )
-        self.latent_scale_factor = config.latent_scale_factor
 
 
     def embed_from_label(self, label: typing.Optional[torch.Tensor], t: torch.Tensor) -> torch.Tensor:
@@ -479,9 +478,8 @@ class DiffusionModel(nn.Module):
 
 
     def forward(self, noise: torch.Tensor, t: torch.Tensor, label: typing.Optional[torch.Tensor]):
-        noise = noise * self.latent_scale_factor
         embedding = self.embed_from_label(label, t)
-        return self.unet(noise, embedding) / self.latent_scale_factor
+        return self.unet(noise, embedding)
 
 
 class DiffusionSampler(nn.Module):
@@ -506,11 +504,10 @@ class DiffusionSampler(nn.Module):
 
         # Coefficients for equation 7
         alpha_t_minus_one = torch.cat([torch.ones(1), alpha_bars])[:alpha_bars.size(0)]
-        beta_bars = betas * (1 - alpha_t_minus_one) / (1 - alpha_bars)
-        self.beta_bars = nn.Embedding.from_pretrained(beta_bars.unsqueeze(1))
+        self.beta_bars = self.betas
         x_0_coeff = alpha_t_minus_one.sqrt() * betas / (1 - alpha_bars)
         self.x_0_coeff = nn.Embedding.from_pretrained(x_0_coeff.unsqueeze(1))
-        x_t_coeff = alphas.sqrt() * beta_bars
+        x_t_coeff = alphas.sqrt() * (1 - alpha_t_minus_one) / (1 - alpha_bars)
         self.x_t_coeff = nn.Embedding.from_pretrained(x_t_coeff.unsqueeze(1))
 
 
